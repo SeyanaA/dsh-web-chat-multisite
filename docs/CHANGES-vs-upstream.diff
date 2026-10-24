@@ -1,0 +1,721 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -1,8 +1,9 @@
+ /**
+  * dsh-deepseek-webchat — browser half.
+  *
+- * A sidebar tab that shows the **real** chat.deepseek.com web app and lets you
+- * push selected DSH messages into it by hand.
++ * A sidebar tab that shows a **real** web-chat site — DeepSeek by default, with
++ * ChatGPT, Gemini and Claude selectable from a toolbar dropdown — and lets you
++ * push selected DSH messages into the DeepSeek composer by hand.
+  *
+  * ## Why this is not an iframe
+  *
+@@ -73,6 +74,26 @@
+ 		/** DeepSeek's default agent, so a conversation URL is `/a/chat/s/<id>`. */
+ 		const AGENT_ID = 'chat'
+ 
++		/** The web-chat sites this panel can host. */
++		const SITES = Object.freeze([
++			Object.freeze({ id: 'deepseek', label: 'DeepSeek', url: 'https://chat.deepseek.com/', host: 'chat.deepseek.com' }),
++			Object.freeze({ id: 'chatgpt', label: 'ChatGPT', url: 'https://chatgpt.com/', host: 'chatgpt.com' }),
++			Object.freeze({ id: 'gemini', label: 'Gemini', url: 'https://gemini.google.com/app', host: 'gemini.google.com' }),
++			Object.freeze({ id: 'claude', label: 'Claude', url: 'https://claude.ai/new', host: 'claude.ai' }),
++		])
++
++		/** The same registry keyed by id. */
++		const SITE_BY_ID = Object.freeze(SITES.reduce((all, site) => {
++			all[site.id] = site
++			return all
++		}, {}))
++
++		/** The site the panel falls back to. */
++		const DEFAULT_SITE_ID = 'deepseek'
++
++		/** Where the chosen site is remembered between page loads. */
++		const SITE_KEY = 'dsh-deepseek-webchat:site'
++
+ 		/**
+ 		 * The storage account asked of the shell. A constant on purpose: the shell
+ 		 * caches one partition per workspace key for the whole app run, so one
+@@ -131,9 +152,11 @@
+ 
+ 		/** Locale-owned copy. */
+ 		const zh = {
+-			'type.label': 'DeepSeek 网页版',
+-			'guide.title': 'DeepSeek 网页版',
+-			'guide.description': '在侧边栏打开 chat.deepseek.com',
++			'type.label': 'Web Chat',
++			'guide.title': 'Web Chat',
++			'guide.description': '在侧边栏打开网页版聊天（DeepSeek / ChatGPT / Gemini / Claude）',
++			'site.title': '网页站点',
++			'status.site': '当前站点：{site}（仅 DeepSeek 支持上下文接力）',
+ 			'action.send': '引用上下文',
+ 			'action.back': '返回网页',
+ 			'action.reload': '刷新',
+@@ -189,9 +212,11 @@
+ 		}
+ 
+ 		const en = {
+-			'type.label': 'DeepSeek Web',
+-			'guide.title': 'DeepSeek Web',
+-			'guide.description': 'Open chat.deepseek.com in the sidebar',
++			'type.label': 'Web Chat',
++			'guide.title': 'Web Chat',
++			'guide.description': 'Open a web chat in the sidebar (DeepSeek / ChatGPT / Gemini / Claude)',
++			'site.title': 'Web chat site',
++			'status.site': 'Site: {site} (context handoff works on DeepSeek only)',
+ 			'action.send': 'Quote context',
+ 			'action.back': 'Back to page',
+ 			'action.reload': 'Reload',
+@@ -295,9 +320,56 @@
+ 				return decodeURIComponent(match[1])
+ 			} catch (error) {
+ 				return match[1]
++			}
++		}
++
++		/**
++		 * @param id - a site id.
++		 * @returns that site, or the default one for an unknown id.
++		 */
++		function siteById(id) {
++			return SITE_BY_ID[typeof id === 'string' ? id : ''] ?? SITE_BY_ID[DEFAULT_SITE_ID]
++		}
++
++		/**
++		 * The web-chat site a URL belongs to, matching its host and subdomains.
++		 * @param value - any URL string.
++		 * @returns the site, or undefined for an unrelated origin.
++		 */
++		function siteOfUrl(value) {
++			if (typeof value !== 'string' || value === '') return undefined
++			let url
++			try {
++				url = new URL(value)
++			} catch (error) {
++				return undefined
+ 			}
++			const host = url.hostname.toLowerCase()
++			for (const site of SITES) {
++				if (host === site.host || host.endsWith('.' + site.host)) return site
++			}
++			return undefined
+ 		}
+ 
++		/** @returns the remembered site id. */
++		function readPersistedSite() {
++			try {
++				const value = globalThis.localStorage?.getItem(SITE_KEY)
++				return SITE_BY_ID[value] === undefined ? DEFAULT_SITE_ID : value
++			} catch (error) {
++				return DEFAULT_SITE_ID
++			}
++		}
++
++		/** @param id - the site id to remember. */
++		function persistSite(id) {
++			try {
++				globalThis.localStorage?.setItem(SITE_KEY, siteById(id).id)
++			} catch (error) {
++				// A blocked storage only costs the preference, not the panel.
++			}
++		}
++
+ 		//#endregion
+ 
+ 		//#region copy
+@@ -347,8 +419,14 @@
+ 		let activeSessionId = undefined
+ 		/** The last URL observed, so a binding is only taken from a settled URL. */
+ 		let lastSeenUrl = ''
++		/** The site the panel is showing; also what the next open navigates to. */
++		let activeSiteId = readPersistedSite()
++		/** The site the guest was last seen on, so a redirect can be followed. */
++		let lastGuestSiteId = activeSiteId
++		/** Whether the host half stores one login snapshot per site (version 2). */
++		let sitesCapable = false
+ 		/** The last URL this plugin asked the guest for, honoured at `dom-ready`. */
+-		let lastRequestedUrl = PAGE_URL
++		let lastRequestedUrl = siteById(activeSiteId).url
+ 		/** True while the picker is open; the guest hides behind it. */
+ 		let overlaySuppressed = false
+ 		/** Subscribers told when the binding state changes. */
+@@ -362,9 +440,103 @@
+ 				ready: guest !== null,
+ 				failure,
+ 				hasBridge: hasBridge(),
++				site: activeSiteId,
++				sites: SITES.map((site) => ({ id: site.id, label: site.label })),
+ 			}
+ 		}
+ 
++		/** In-flight capability probe, shared by every caller. */
++		let hostSitesProbe = null
++
++		/**
++		 * Ask the host half whether it stores one login snapshot per site.
++		 *
++		 * Version 1 of the host only knew DeepSeek. The browser half still works
++		 * against it: the dropdown switches sites, and only the DeepSeek snapshot
++		 * is read or written until the host half is updated.
++		 * @returns the capability once known.
++		 */
++		function probeHostSites() {
++			if (hostSitesProbe !== null) return hostSitesProbe
++			hostSitesProbe = (async () => {
++				try {
++					const response = await fetch(ROUTES.state, { method: 'GET' })
++					const payload = await response.json()
++					sitesCapable = payload?.sitesVersion === 2
++				} catch (error) {
++					sitesCapable = false
++				}
++				notify()
++				return sitesCapable
++			})()
++			return hostSitesProbe
++		}
++
++		/** @returns the capability probe, awaited before the first guest is created. */
++		function ensureHostSites() {
++			return probeHostSites()
++		}
++
++		/**
++		 * Show another web-chat site in the panel.
++		 * @param id - the site to show.
++		 */
++		async function switchSite(id) {
++			const site = siteById(id)
++			if (guest !== null) {
++				let current = ''
++				try {
++					current = guest.element.getURL()
++				} catch (error) {
++					current = ''
++				}
++				if (siteOfUrl(current)?.id === site.id) {
++					activeSiteId = site.id
++					persistSite(site.id)
++					notify()
++					return
++				}
++				// Keep the site being left signed in where the host can store it.
++				try {
++					await saveGuestSession(true)
++				} catch (error) {
++					// A snapshot that fails costs a login, not the panel.
++				}
++			}
++			activeSiteId = site.id
++			lastGuestSiteId = site.id
++			lastRequestedUrl = site.url
++			lastSeenUrl = ''
++			persistSite(site.id)
++			notify()
++			if (guest === null) {
++				void ensureGuest()
++				return
++			}
++			navigate(site.url)
++		}
++
++		/**
++		 * Follow the guest's own navigation (redirects included) so the toolbar
++		 * shows the site it actually landed on.
++		 * @param element - the live webview.
++		 */
++		function syncSiteFromUrl(element) {
++			let url
++			try {
++				url = element.getURL()
++			} catch (error) {
++				return
++			}
++			const site = siteOfUrl(url)
++			if (site === undefined || site.id === lastGuestSiteId) return
++			lastGuestSiteId = site.id
++			if (site.id === activeSiteId) return
++			activeSiteId = site.id
++			persistSite(site.id)
++			notify()
++		}
++
+ 		/** Notify every subscriber that the guest state changed. */
+ 		function notify() {
+ 			diag.notify += 1
+@@ -584,6 +756,9 @@
+ 				'.dswc-status{font-size:11px;line-height:1;color:var(--dsw-alias-label-tertiary,#adb2b8)}',
+ 				'.dswc-status[data-state="bound"]{color:#2ea043}',
+ 				'.dswc-status[data-state="error"]{color:#d1242f}',
++				'.dswc-status[data-state="site"]{color:var(--dsw-alias-label-tertiary,#adb2b8)}',
++				'.dswc-select{font:inherit;font-size:11px;height:22px;max-width:120px;padding:0 4px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.35));background:transparent;color:inherit;cursor:pointer}',
++				'.dswc-select:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}',
+ 				'.dswc-gap{flex:1 1 auto}',
+ 				'.dswc-button{font:inherit;font-size:11px;padding:3px 8px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.35));background:transparent;color:inherit;cursor:pointer;white-space:nowrap}',
+ 				'.dswc-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12))}',
+@@ -779,10 +954,21 @@
+ 			if (value) hideOverlay()
+ 		}
+ 
+-		/** Ask the host to put the saved login back before the page is navigated. */
+-		async function restoreGuestSession() {
++		/**
++		 * Ask the host for a site's saved login before the site is restored.
++		 * @param site - the site whose snapshot is wanted.
++		 * @returns the stored state, or null when there is none.
++		 */
++		async function restoreGuestSession(site) {
++			const id = siteById(site).id
++			// A version-1 host only knows DeepSeek: never feed its snapshot to
++			// another site, and never ask it to label one it cannot.
++			if (!sitesCapable && id !== 'deepseek') return null
+ 			try {
+-				const response = await fetch(ROUTES.sessionRestore, { method: 'POST' })
++				const url = sitesCapable
++					? ROUTES.sessionRestore + '?site=' + encodeURIComponent(id)
++					: ROUTES.sessionRestore
++				const response = await fetch(url, { method: 'POST' })
+ 				const payload = await response.json()
+ 				if (payload === null || typeof payload !== 'object') return null
+ 				const storage = Array.isArray(payload.storage) ? payload.storage : []
+@@ -861,8 +1047,17 @@
+ 		 */
+ 		async function saveGuestSession(withState) {
+ 			if (guest === null) return
+-			// Never let an off-origin read blank the snapshot.
+-			if (!onDeepSeekOrigin(guest.element)) return
++			let currentUrl = ''
++			try {
++				currentUrl = guest.element.getURL()
++			} catch (error) {
++				return
++			}
++			// Never let an off-site read blank a snapshot, and never write a site
++			// the host cannot label (a version-1 host only understands DeepSeek).
++			const site = siteOfUrl(currentUrl)
++			if (site === undefined) return
++			if (!sitesCapable && site.id !== 'deepseek') return
+ 			let state = null
+ 			if (withState) {
+ 				try {
+@@ -877,6 +1072,7 @@
+ 					method: 'POST',
+ 					headers: { 'content-type': 'application/json' },
+ 					body: JSON.stringify({
++						site: site.id,
+ 						storage: Array.isArray(state?.storage) ? state.storage : [],
+ 						cookie: typeof state?.cookie === 'string' ? state.cookie : '',
+ 					}),
+@@ -1047,6 +1243,8 @@
+ 		async function focusSession(rawSessionId) {
+ 			const dshSessionId = canonicalSessionId(rawSessionId)
+ 			if (dshSessionId === '') return
++			// Only the DeepSeek site has conversations to bind to DSH Sessions.
++			if (activeSiteId !== 'deepseek') return
+ 			activeSessionId = dshSessionId
+ 			if (guest === null) return
+ 			let current
+@@ -1143,7 +1341,7 @@
+ 						|| typeof reservation.partition !== 'string') {
+ 						throw new Error('the desktop browser bridge returned no reservation')
+ 					}
+-					const restored = await restoreGuestSession()
++					await ensureHostSites()
+ 					const element = document.createElement('webview')
+ 					element.setAttribute('name', reservation.lease)
+ 					element.setAttribute('partition', reservation.partition)
+@@ -1155,7 +1353,8 @@
+ 						partition: reservation.partition,
+ 						element,
+ 						container: overlayContainer(),
+-						storageState: restored === null ? 'none' : 'pending',
++						restoredSites: new Set(),
++						restoringSite: '',
+ 						timer: 0,
+ 						poller: 0,
+ 					}
+@@ -1172,33 +1371,40 @@
+ 						navigate(lastRequestedUrl)
+ 					}, { once: true })
+ 					// Storage and cookies can only be written while the page is on
+-					// its own origin, so both are restored after the first load of
+-					// the real site and the page is then asked to load once more —
+-					// this time already signed in. The origin check matters: the
+-					// guest's first document is `about:blank#<lease>`, where writing
+-					// storage throws, and treating that as the restore would burn
+-					// the one attempt. Until this settles, snapshots are skipped:
+-					// the freshly loaded page still has empty storage, and saving
+-					// that would erase the very snapshot being restored.
+-					element.addEventListener('did-finish-load', () => {
+-						if (record.storageState !== 'pending') return
+-						if (!onDeepSeekOrigin(element)) return
+-						record.storageState = 'restoring'
+-						Promise.resolve(writeGuestState(element, restored))
+-							.then(() => {
+-								record.storageState = 'done'
+-								element.reload()
+-							})
+-							.catch(() => {
+-								record.storageState = 'done'
+-							})
+-					})
++					// its own origin, so they are restored after a real site loads
++					// and the page is then asked to load once more — this time
++					// already signed in. The origin check matters: the guest's first
++					// document is `about:blank#<lease>`, where writing storage throws,
++					// and treating that as the restore would burn the one attempt.
++					//
++					// A snapshot is restored once per site and app run: the guest
++					// partition is per-run, so every site starts logged out on each
++					// launch and needs its own storage replayed before it settles.
+ 					element.addEventListener('did-finish-load', () => {
+-						if (record.storageState === 'pending' || record.storageState === 'restoring') return
+-						void saveGuestSession(true)
++						const site = siteOfUrl(element.getURL())
++						if (site === undefined || record.restoringSite !== '') return
++						if (record.restoredSites.has(site.id)) {
++							void saveGuestSession(true)
++							return
++						}
++						record.restoredSites.add(site.id)
++						record.restoringSite = site.id
++						void restoreGuestSession(site.id).then((snapshot) => {
++							record.restoringSite = ''
++							if (snapshot === null) return undefined
++							return Promise.resolve(writeGuestState(element, snapshot))
++								.then(() => {
++									element.reload()
++								})
++								.catch(() => undefined)
++						})
+ 					})
+ 					for (const event of ['did-navigate', 'did-navigate-in-page', 'did-finish-load']) {
+ 						element.addEventListener(event, () => {
++							// Follow a redirect so the toolbar shows the site the
++							// guest actually landed on, then let the URL settle before
++							// any conversation is adopted.
++							syncSiteFromUrl(element)
+ 							// A navigation means the URL is worth re-reading, but it
+ 							// must not clear the settle marker: the poll below settles
+ 							// by seeing the same URL twice, and wiping it on every
+@@ -1656,6 +1862,21 @@
+ 		 */
+ 		function GuideArtwork(props) {
+ 			return ChatBubbleGlyph(props)
++		}
++
++		/** The left-rail entry id: the global-panel key and the `main` view it selects. */
++		const SIDEBAR_ENTRY_ID = 'deepseek-webchat'
++
++		/**
++		 * The left-rail entry's glyph. The sidebar's panel rows hand this slot
++		 * `{ size, active }`; the bubble reads the size and inherits the row's ink
++		 * through `currentColor`.
++		 *
++		 * @param props - `{ size }` from the panel row.
++		 * @returns the glyph.
++		 */
++		function WebChatEntryGlyph(props) {
++			return ChatBubbleGlyph({ size: props?.size })
+ 		}
+ 
+ 		/**
+@@ -1671,6 +1892,8 @@
+ 			// old always-park behaviour rather than hiding the guest forever.
+ 			const tabVisible = tabInfo?.tab?.visible !== false
+ 			const t = props.t ?? fallbackTranslate()
++			// The site the panel is showing; changing it re-runs the effect below.
++			const siteId = guestState().site
+ 
+ 			const hostRef = React.useRef(null)
+ 			const [version, setVersion] = React.useState(0)
+@@ -1729,25 +1952,29 @@
+ 
+ 			// Follow the DSH Session this pane belongs to.
+ 			//
+-			// This depends on `sessionId` alone. It used to depend on `version`
+-			// too, which is bumped by every notify() — and notify() fires from the
+-			// guest's own navigation events. That made the effect re-run on every
+-			// navigation, navigate again, and so notify itself: an endless
+-			// navigate/notify ping-pong that showed up as the panel flickering.
++			// This deliberately does NOT depend on `version`: that is bumped by
++			// every notify() — and notify() fires from the guest's own navigation
++			// events, so depending on it made the effect navigate again and notify
++			// itself in a ping-pong that showed up as the panel flickering.
++			//
++			// It does depend on the site: switching sites decides whether the
++			// DeepSeek conversation (and its binding) should be restored.
+ 			React.useEffect(() => {
+ 				if (sessionId === undefined) return undefined
+ 				let cancelled = false
+ 				void (async () => {
+ 					await ensureGuest()
+ 					if (cancelled) return
+-					await focusSession(sessionId)
+-					if (cancelled) return
++					if (guestState().site === 'deepseek') {
++						await focusSession(sessionId)
++						if (cancelled) return
++					}
+ 					setBound(await readBinding(sessionId))
+ 				})()
+ 				return () => {
+ 					cancelled = true
+ 				}
+-			}, [sessionId])
++			}, [sessionId, siteId])
+ 
+ 			// Park the guest on the measured area, and keep it parked.
+ 			//
+@@ -2040,30 +2267,47 @@
+ 			}, [sessionId, t])
+ 
+ 			const state = guestState()
++			const isDeepSeek = state.site === 'deepseek'
++			const siteLabel = siteById(state.site).label
+ 			const statusText = state.failure !== ''
+ 				? format(t('status.failed'), { error: state.failure })
+-				: (bound !== null ? format(t('status.bound'), { id: bound }) : t('status.unbound'))
++				: (isDeepSeek
++					? (bound !== null ? format(t('status.bound'), { id: bound }) : t('status.unbound'))
++					: format(t('status.site'), { site: siteLabel }))
+ 
+ 			// A glyph, not a sentence: the full status is the tooltip, because a
+ 			// failure message is far too long for a toolbar.
+-			const statusGlyph = state.failure !== '' ? '⚠' : (bound !== null ? '●' : '○')
++			const statusGlyph = state.failure !== '' ? '⚠' : (isDeepSeek ? (bound !== null ? '●' : '○') : '◆')
+ 
+ 			const toolbar = h('div', { className: 'dswc-toolbar' }, [
++				h('select', {
++					key: 'site',
++					className: 'dswc-select',
++					value: state.site,
++					title: t('site.title'),
++					'aria-label': t('site.title'),
++					onChange: (event) => {
++						// A switch leaves the DeepSeek picker behind; close it so the
++						// new site is visible and the guest is not suppressed.
++						setPickerOpen(false)
++						void switchSite(event.target.value)
++					},
++				}, state.sites.map((site) => h('option', { key: site.id, value: site.id }, site.label))),
+ 				h('span', {
+ 					key: 'status',
+ 					className: 'dswc-status',
+ 					title: statusText,
+ 					role: 'img',
+ 					'aria-label': statusText,
+-					'data-state': state.failure !== '' ? 'error' : (bound !== null ? 'bound' : 'unbound'),
++					'data-state': state.failure !== '' ? 'error' : (isDeepSeek ? (bound !== null ? 'bound' : 'unbound') : 'site'),
+ 				}, statusGlyph),
+ 				h('span', { key: 'gap', className: 'dswc-gap' }),
+-				h('button', {
++				isDeepSeek ? h('button', {
+ 					key: 'send',
+ 					type: 'button',
+ 					className: 'dswc-button',
+ 					onClick: () => setPickerOpen((open) => !open),
+-				}, pickerOpen ? t('action.back') : t('action.send')),
++				}, pickerOpen ? t('action.back') : t('action.send')) : null,
+ 				h('button', {
+ 					key: 'reload',
+ 					type: 'button',
+@@ -2078,13 +2322,13 @@
+ 						}
+ 					},
+ 				}, t('action.reload')),
+-				h('button', {
++				isDeepSeek ? h('button', {
+ 					key: 'unbind',
+ 					type: 'button',
+ 					className: 'dswc-button',
+ 					disabled: bound === null,
+ 					onClick: () => void unbind(),
+-				}, t('action.rebind')),
++				}, t('action.rebind')) : null,
+ 			])
+ 
+ 			const toastRow = toast === ''
+@@ -2339,6 +2583,8 @@
+ 			ensureStyle()
+ 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'deepseek-webchat: copy')
+ 			const t = ctx.locale.bind(NS)
++			// Ask whether this host half can store one snapshot per site.
++			void probeHostSites()
+ 			ctx.effect(() => ctx.sidebarRightTabs.register({
+ 				id: TAB_ID,
+ 				kind: TAB_KIND,
+@@ -2361,15 +2607,56 @@
+ 				locale: NS,
+ 				inject: (sessionId) => ({ sessionId }),
+ 			}, DeepSeekBody)), 'deepseek-webchat: body')
+-			ctx.effect(() => ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+-				name: 'conversation.session.header.utilities',
+-				id: 'deepseek-webchat',
+-				order: 20,
+-				locale: NS,
+-				inject: (sessionId) => ({
+-					open: () => ctx.sidebarRight.openTabIn(sessionId, TAB_KIND, { revealIfOpened: true }),
+-				}),
+-			}, HeaderButton)), 'deepseek-webchat: header door')
++			// The left rail's door: a global-panel row directly under New Session,
++			// labelled "Web Chat". A panel row can only select a main-panel view, so
++			// that view is a door too: it opens (or reveals) this plugin's tab for
++			// the Session on screen and hands the main column back to the
++			// Conversation in the same commit, so the click reads as "open the
++			// chat" rather than "leave the conversation".
++			function openDoor() {
++				try {
++					ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true })
++					return true
++				} catch (error) {
++					// Nothing is on screen yet (the hero): start a Session, then retry
++					// until its surface is mounted.
++					const uiWorkspace = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined
++					if (uiWorkspace === undefined) return false
++					try { uiWorkspace.startSession() } catch (startError) { return false }
++					let attempts = 0
++					const retry = () => {
++						attempts += 1
++						try {
++							ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true })
++						} catch (retryError) {
++							if (attempts < 12) setTimeout(retry, 120)
++						}
++					}
++					setTimeout(retry, 120)
++					return false
++				}
++			}
++			const returnToConversation = () => {
++				const layout = typeof ctx.get === 'function' ? ctx.get('layout') : undefined
++				try { layout?.selectPanel(null) } catch (error) {}
++			}
++			function WebChatDoor() {
++				React.useLayoutEffect(() => {
++					openDoor()
++					returnToConversation()
++				}, [])
++				return null
++			}
++			ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
++				name: 'sidebar.panellist',
++				id: SIDEBAR_ENTRY_ID,
++				order: -1,
++				label: () => 'Web Chat',
++			}, WebChatEntryGlyph)), 'deepseek-webchat: sidebar entry')
++			ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
++				name: 'main',
++				key: SIDEBAR_ENTRY_ID,
++			}, WebChatDoor)), 'deepseek-webchat: sidebar door view')
+ 			ctx.effect(() => () => {
+ 				disposeGuest()
+ 			}, 'deepseek-webchat: guest lifetime')
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -725,15 +725,47 @@
+ 
+ //#region guest session snapshot
+ 
++/** The web-chat sites the browser half may keep a login snapshot for. */
++const GUEST_SITES = new Set(['deepseek', 'chatgpt', 'gemini', 'claude'])
++
+ /**
+- * Persist the guest's own storage and cookie string.
++ * Reduce whatever the browser half sent to a known site id.
++ * @param value - the site id from a query string or JSON body.
++ * @returns the id, defaulting to DeepSeek for older callers.
++ */
++export function guestSite(value) {
++  return typeof value === 'string' && GUEST_SITES.has(value) ? value : 'deepseek'
++}
++
++/**
++ * Read the whole snapshot file, upgrading the version-1 single-site format.
++ * @returns `{ version: 2, sites: { [site]: { savedAt, storage, cookie } } }`.
++ */
++function readGuestSnapshot() {
++  const raw = readJsonFile(sessionFile())
++  const sites = {}
++  if (raw === null || typeof raw !== 'object') return { version: 2, sites }
++  if (typeof raw.sites === 'object' && raw.sites !== null && !Array.isArray(raw.sites)) {
++    for (const [site, value] of Object.entries(raw.sites)) {
++      if (!GUEST_SITES.has(site) || value === null || typeof value !== 'object') continue
++      sites[site] = value
++    }
++    return { version: 2, sites }
++  }
++  // Version 1 held DeepSeek's snapshot only.
++  sites.deepseek = { savedAt: raw.savedAt ?? null, storage: raw.storage, cookie: raw.cookie }
++  return { version: 2, sites }
++}
++
++/**
++ * Persist one site's own storage and cookie string.
+  * @param storage - `[key, value]` pairs from the guest's localStorage.
+  * @param cookie - the guest's `document.cookie`.
++ * @param site - the site id the guest was on.
+  * @returns the snapshot that was written.
+  */
+-export function saveGuestSession(storage, cookie) {
++export function saveGuestSession(storage, cookie, site = 'deepseek') {
+   const snapshot = {
+-    version: 1,
+     savedAt: new Date().toISOString(),
+     storage: Array.isArray(storage)
+       ? storage.filter(
+@@ -742,16 +774,20 @@
+       : [],
+     cookie: typeof cookie === 'string' ? cookie : '',
+   }
+-  writeJsonFile(sessionFile(), snapshot)
++  const file = readGuestSnapshot()
++  file.sites[guestSite(site)] = snapshot
++  writeJsonFile(sessionFile(), file)
+   return snapshot
+ }
+ 
+ /**
+- * @returns the stored guest state, or null when nothing usable is saved.
++ * @param site - the site id whose snapshot is wanted.
++ * @returns the stored state for that site, or null when nothing usable is saved.
+  */
+-export function loadGuestSession() {
+-  const snapshot = readJsonFile(sessionFile())
+-  if (snapshot === null) return null
++export function loadGuestSession(site = 'deepseek') {
++  const file = readGuestSnapshot()
++  const snapshot = file.sites[guestSite(site)]
++  if (snapshot === null || typeof snapshot !== 'object') return null
+   const storage = Array.isArray(snapshot.storage) ? snapshot.storage : []
+   const cookie = typeof snapshot.cookie === 'string' ? snapshot.cookie : ''
+   if (storage.length === 0 && cookie === '') return null
+@@ -936,6 +972,7 @@
+         sessionQuery: ctx.get('sessionQuery') !== undefined,
+         bindings: Object.keys(readBindings()).length,
+         sessionSaved: readJsonFile(sessionFile()) !== null,
++        sitesVersion: 2,
+       })
+     },
+   }), 'deepseek-webchat: state route')
+@@ -1023,7 +1060,7 @@
+     kind: 'exact',
+     path: ROUTES.sessionRestore,
+     handler: (req, res) => {
+-      const saved = loadGuestSession()
++      const saved = loadGuestSession(guestSite(queryParam(req.url, 'site')))
+       json(res, 200, {
+         ok: true,
+         storage: saved === null ? [] : saved.storage,
+@@ -1041,7 +1078,7 @@
+         json(res, 400, { ok: false, error: 'a JSON body is required' })
+         return
+       }
+-      const snapshot = saveGuestSession(body.storage, body.cookie)
++      const snapshot = saveGuestSession(body.storage, body.cookie, guestSite(body.site))
+       json(res, 200, { ok: true, storage: snapshot.storage.length, cookie: snapshot.cookie !== '' })
+     },
+   }), 'deepseek-webchat: session save route')

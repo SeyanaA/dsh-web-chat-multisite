@@ -1,0 +1,37 @@
+Web Chat for DSH (dsh-web-chat-multisite)
+=========================================
+
+This package is a modified derivative ("fork") of:
+
+  dsh-deepseek-webchat 0.4.10
+  https://github.com/Ckarefulon/dsh-deepseek-webchat
+  Copyright (c) 2026 Ckarefulon
+  Licensed under the MIT License (see LICENSE)
+
+Modifications in this fork
+--------------------------
+Copyright (c) 2026 SeyanaA, released under the same MIT License.
+
+  1. Entry moved to the left sidebar: a native "Web Chat" global-panel row
+     directly under New Session (replaces the conversation-header icon).
+     Clicking it opens (or reveals) the chat tab and returns the main column
+     to the Conversation.
+  2. Toolbar site selector: DeepSeek / ChatGPT / Gemini / Claude. Switching
+     navigates the same native browser guest to the selected web chat; the
+     choice is remembered.
+  3. DeepSeek-only controls (context handoff, binding, binding status) are
+     hidden while another site is selected.
+  4. The host half now stores one login snapshot per site
+     (session.json version 2; the version-1 DeepSeek snapshot is migrated
+     automatically).
+  5. Tab / guide copy generalized from "DeepSeek Web" to "Web Chat".
+
+The exact code differences against the upstream 0.4.10 release are recorded
+in docs/CHANGES-vs-upstream.diff.
+
+Trademarks
+----------
+DeepSeek, ChatGPT, Gemini and Claude are trademarks of their respective
+owners. This project is unofficial and is not affiliated with, endorsed by,
+or sponsored by DeepSeek, OpenAI, Google or Anthropic. It embeds the public
+web apps of those services in the user's own logged-in browser session.

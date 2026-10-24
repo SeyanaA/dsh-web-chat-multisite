@@ -1,0 +1,73 @@
+{
+  "name": "dsh-deepseek-webchat",
+  "version": "0.5.0-multisite",
+  "description": "Web Chat panel for DeepSeek Harness Desktop: pick DeepSeek, ChatGPT, Gemini or Claude in one native sidebar tab. Fork of dsh-deepseek-webchat 0.4.10 (MIT) by Ckarefulon, extended with a left-sidebar entry and a web-chat site selector.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "webchat",
+    "chatgpt",
+    "gemini",
+    "claude",
+    "sidebar",
+    "harness-plugin",
+    "plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SeyanaA/dsh-web-chat-multisite.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/SeyanaA/dsh-web-chat-multisite#readme",
+  "bugs": {
+    "url": "https://github.com/SeyanaA/dsh-web-chat-multisite/issues"
+  },
+  "author": "Ckarefulon (upstream dsh-deepseek-webchat); modifications by SeyanaA",
+  "contributors": [
+    {
+      "name": "Ckarefulon",
+      "url": "https://github.com/Ckarefulon"
+    },
+    {
+      "name": "SeyanaA",
+      "url": "https://github.com/SeyanaA"
+    }
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.1"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ]
+}

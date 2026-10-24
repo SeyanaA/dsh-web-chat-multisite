@@ -1,0 +1,2671 @@
+/**
+ * dsh-deepseek-webchat — browser half.
+ *
+ * A sidebar tab that shows a **real** web-chat site — DeepSeek by default, with
+ * ChatGPT, Gemini and Claude selectable from a toolbar dropdown — and lets you
+ * push selected DSH messages into the DeepSeek composer by hand.
+ *
+ * ## Why this is not an iframe
+ *
+ * `chat.deepseek.com` answers with `Content-Security-Policy: frame-ancestors
+ * 'none'`, so an `<iframe>` is refused by the page itself. The only supported
+ * way in is the desktop shell's own browser guest channel: this bundle asks
+ * `globalThis.dshDesktop.browser.acquire(workspace)` for a reservation, then
+ * attaches a `<webview>` whose `src` is `about:blank#<lease>` and whose
+ * `partition` is the one the shell issued. The shell's `will-attach-webview`
+ * matches the lease, rewrites the element with hardened web preferences and
+ * lets the navigation through. That is the same channel the built-in side-card
+ * browser uses, so `frame-ancestors` never enters into it.
+ *
+ * ## Why the guest lives outside React
+ *
+ * A `<webview>` is destroyed when it leaves the document. If the slot owned it,
+ * every look at another tab would tear down the page and reload it — losing a
+ * half-typed question and re-running the site's boot. So the element lives in a
+ * container this plugin owns at the document root, and the slot's body only
+ * *measures* its area: the persistent guest is positioned onto that rectangle
+ * while this tab is showing, and hidden when it is not. The tab type declares
+ * `keepMounted: true` so the body itself survives tab switches and can keep
+ * reporting that rectangle.
+ *
+ * ## One DeepSeek conversation per DSH Session
+ *
+ * DeepSeek's own routes (read from its shipped bundle) are
+ * `/a/:agentId/s/:sessionId`, so a conversation is addressable as a plain URL.
+ * The mapping DSH Session → DeepSeek conversation id is learned by watching the
+ * guest's URL (the id only appears once the first message is sent, because
+ * DeepSeek creates conversations lazily) and is persisted by the host half,
+ * which is where a durable file can live.
+ *
+ * ## What this half never does
+ *
+ * It never sends anything to DeepSeek on its own. Selecting messages composes a
+ * blockquote and *fills the composer*; pressing Enter is the human's move. It
+ * never reads a DeepSeek answer back into the DSH conversation, and it never
+ * quotes system, developer or injected-prompt events — those are filtered by the
+ * host half before they reach the picker.
+ */
+
+window.__ModuleLoader__.load({
+	id: 'dsh-deepseek-webchat',
+	factory: (require) => {
+		// The loader passes `require` but no `module`, so every bundle declares
+		// its own CommonJS-ish pair, exactly as the shipped bundles do.
+		const module = { exports: {} }
+		const exports = module.exports
+		Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
+
+		const React = require('react')
+
+		const h = React.createElement
+
+		/** Locale namespace, and the i18n key for this plugin's copy. */
+		const NS = 'dsh-deepseek-webchat'
+
+		/** The tab type id; the slot dispatch key for this plugin's body. */
+		const TAB_ID = 'dsh-deepseek-webchat'
+
+		/** The tab kind. Unique per profile — the type registry keys on it. */
+		const TAB_KIND = 'deepseek-webchat'
+
+		/** The real web app. Never an API host, never an iframe. */
+		const PAGE_URL = 'https://chat.deepseek.com/'
+
+		/** DeepSeek's default agent, so a conversation URL is `/a/chat/s/<id>`. */
+		const AGENT_ID = 'chat'
+
+		/** The web-chat sites this panel can host. */
+		const SITES = Object.freeze([
+			Object.freeze({ id: 'deepseek', label: 'DeepSeek', url: 'https://chat.deepseek.com/', host: 'chat.deepseek.com' }),
+			Object.freeze({ id: 'chatgpt', label: 'ChatGPT', url: 'https://chatgpt.com/', host: 'chatgpt.com' }),
+			Object.freeze({ id: 'gemini', label: 'Gemini', url: 'https://gemini.google.com/app', host: 'gemini.google.com' }),
+			Object.freeze({ id: 'claude', label: 'Claude', url: 'https://claude.ai/new', host: 'claude.ai' }),
+		])
+
+		/** The same registry keyed by id. */
+		const SITE_BY_ID = Object.freeze(SITES.reduce((all, site) => {
+			all[site.id] = site
+			return all
+		}, {}))
+
+		/** The site the panel falls back to. */
+		const DEFAULT_SITE_ID = 'deepseek'
+
+		/** Where the chosen site is remembered between page loads. */
+		const SITE_KEY = 'dsh-deepseek-webchat:site'
+
+		/**
+		 * The storage account asked of the shell. A constant on purpose: the shell
+		 * caches one partition per workspace key for the whole app run, so one
+		 * identity means one DeepSeek login shared by every DSH Session, with the
+		 * per-Session split living in the conversation URL instead.
+		 */
+		const WORKSPACE = 'deepseek-webchat'
+
+		/** How often the guest's storage is snapshotted, in ms. */
+		const SAVE_INTERVAL_MS = 30000
+
+		/** How often the guest's URL is re-read as a fallback, in ms. */
+		const URL_POLL_MS = 2000
+
+		/**
+		 * How often the guest is re-parked as a fallback, in ms.
+		 *
+		 * The ResizeObserver catches size changes; this only has to catch a pane
+		 * that moved without resizing. Every tick forces a layout read, so a fast
+		 * timer here is real work — the previous 250 ms was four forced layouts a
+		 * second for something the observer already covers.
+		 */
+		const PANE_POLL_MS = 2000
+
+		/**
+		 * How many rows the picker mounts per page.
+		 *
+		 * A session can hold hundreds of rows — one measured at 555 — and building
+		 * plus laying out all of them blocks the main thread: 73 ms for 555, mostly
+		 * the forced layout. The list opens on the newest few, which is what a
+		 * person actually picks from, and older rows are loaded a page at a time
+		 * from the top. Selection is by `seq`, so the bulk actions still cover the
+		 * whole session rather than only what is mounted.
+		 */
+		const LIST_PAGE_SIZE = 10
+
+		/** Attribute marking this plugin's document-root guest container. */
+		const OVERLAY_ATTR = 'data-dsh-deepseek-webchat-overlay'
+
+		/**
+		 * The host half's routes.
+		 *
+		 * Both halves keep their own copy of this table, and a missing entry fails
+		 * silently: the call becomes `fetch(undefined)`, which rejects into whatever
+		 * catch swallows it, so the feature simply never happens. A test asserts the
+		 * two lists agree.
+		 */
+		const ROUTES = {
+			state: '/api/dsh-deepseek-webchat/state',
+			messages: '/api/dsh-deepseek-webchat/messages',
+			binding: '/api/dsh-deepseek-webchat/binding',
+			sessionRestore: '/api/dsh-deepseek-webchat/session/restore',
+			sessionSave: '/api/dsh-deepseek-webchat/session/save',
+			diag: '/api/dsh-deepseek-webchat/diag',
+		}
+
+		/** Locale-owned copy. */
+		const zh = {
+			'type.label': 'Web Chat',
+			'guide.title': 'Web Chat',
+			'guide.description': '在侧边栏打开网页版聊天（DeepSeek / ChatGPT / Gemini / Claude）',
+			'site.title': '网页站点',
+			'status.site': '当前站点：{site}（仅 DeepSeek 支持上下文接力）',
+			'action.send': '引用上下文',
+			'action.back': '返回网页',
+			'action.reload': '刷新',
+			'action.rebind': '解除绑定',
+			'action.refresh': '重新读取',
+			'action.all': '全选',
+			'action.none': '清除',
+			'action.last': '选末尾',
+			'action.fill': '填入并发送',
+			'action.fillOnly': '仅填入',
+			'action.copy': '复制',
+			'picker.title': '选择要引用的消息',
+			'picker.empty': '这个会话还没有可引用的消息。',
+			'picker.emptyAdvanced': '这个会话还没有可引用的内容。',
+			'picker.loading': '正在读取会话…',
+			'picker.selected': '已选 {count} 条',
+			'picker.hiddenEarlier': '上面还有 {count} 条更早的',
+			'picker.droppedEarlier': '这个会话太长，最前面 {count} 条没有列出',
+			'action.loadEarlier': '加载更早的 {count} 条',
+			'picker.role.user': '用户',
+			'picker.role.assistant': '助手',
+			'picker.role.tool': '工具',
+			'picker.advanced': '高级：包含思考过程与工具调用',
+			'picker.advancedHint': '默认只列你与助手的对话，以及 AI 向你提的问题和选项。打开后会额外列出思考过程、工具调用、工具结果、待办、命令与压缩摘要。',
+			'picker.kind.question': '提问',
+			'picker.kind.answer': '回答',
+			'picker.kind.reasoning': '思考',
+			'picker.kind.toolCall': '调用',
+			'picker.kind.toolResult': '结果',
+			'picker.kind.todo': '待办',
+			'picker.kind.command': '命令',
+			'picker.kind.summary': '摘要',
+			'picker.preamble': '附上说明',
+			'picker.preambleHint': '在引用内容前面加一小段说明，告诉 DeepSeek 这些内容是什么、来自哪里。',
+			'picker.preambleText': '以下是我在另一个 AI 助手（DSH）里的对话片段，引用给你作为背景参考。以「> 」开头的行是原文，【】里标出的是这段内容属于谁（用户、助手、提问、回答、工具调用等）。请先理解这些背景，再回答我最下面的问题；如果背景里有不清楚的地方，请直接指出。',
+			'picker.lastCount': '末尾条数',
+			'picker.question': '要一起发送的问题或指令（可选）',
+			'picker.questionPlaceholder': '例如：请基于以上内容，帮我补充一个更完整的方案。',
+			'picker.preview': '将填入 DeepSeek 输入框的内容',
+			'picker.hint': '点「填入并发送」会直接把预览内容发给 DeepSeek；想先自己确认就点「仅填入」。两种情况都不会改动 DSH 里的对话。',
+			'toast.sent': '已发送到 DeepSeek（{count} 字）。',
+			'toast.sendPending': '已填入 DeepSeek 输入框，但自动发送没有生效 —— 请手动按 Enter。',
+			'status.bound': '已绑定 DeepSeek 会话 {id}',
+			'status.unbound': '未绑定 —— 在 DeepSeek 里发出第一条消息后自动绑定',
+			'status.nobridge': '当前环境没有桌面浏览器通道，无法嵌入真实网页版。',
+			'status.nobridgeHint': '请在 DSH 桌面版里使用；`dsh web` 之类的普通网页 profile 不带这个通道。',
+			'status.failed': '嵌入失败：{error}',
+			'status.filling': '正在填入…',
+			'toast.filled': '已填入 DeepSeek 输入框（{count} 字），请手动按 Enter 发送。',
+			'toast.nocomposer': '没找到 DeepSeek 输入框，请先在网页里打开一个对话。',
+			'toast.copied': '已复制到剪贴板。',
+			'toast.rebound': '已解除绑定，下次打开将新建对话。',
+		}
+
+		const en = {
+			'type.label': 'Web Chat',
+			'guide.title': 'Web Chat',
+			'guide.description': 'Open a web chat in the sidebar (DeepSeek / ChatGPT / Gemini / Claude)',
+			'site.title': 'Web chat site',
+			'status.site': 'Site: {site} (context handoff works on DeepSeek only)',
+			'action.send': 'Quote context',
+			'action.back': 'Back to page',
+			'action.reload': 'Reload',
+			'action.rebind': 'Unbind',
+			'action.refresh': 'Read again',
+			'action.all': 'Select all',
+			'action.none': 'Clear',
+			'action.last': 'Last',
+			'action.fill': 'Fill and send',
+			'action.fillOnly': 'Fill only',
+			'action.copy': 'Copy',
+			'picker.title': 'Choose messages to quote',
+			'picker.empty': 'This session has no quotable messages yet.',
+			'picker.emptyAdvanced': 'This session has nothing quotable yet.',
+			'picker.loading': 'Reading the session…',
+			'picker.selected': '{count} selected',
+			'picker.hiddenEarlier': '{count} earlier rows above',
+			'picker.droppedEarlier': 'This session is long: the oldest {count} rows are not listed',
+			'action.loadEarlier': 'Load {count} earlier',
+			'picker.role.user': 'User',
+			'picker.role.assistant': 'Assistant',
+			'picker.role.tool': 'Tool',
+			'picker.advanced': 'Advanced: include thinking and tool calls',
+			'picker.advancedHint': 'By default this lists your conversation with the assistant plus the questions it asked you and their options. Turning this on also lists thinking, tool calls, tool results, todos, commands and compaction summaries.',
+			'picker.kind.question': 'Question',
+			'picker.kind.answer': 'Answer',
+			'picker.kind.reasoning': 'Thinking',
+			'picker.kind.toolCall': 'Call',
+			'picker.kind.toolResult': 'Result',
+			'picker.kind.todo': 'Todo',
+			'picker.kind.command': 'Command',
+			'picker.kind.summary': 'Summary',
+			'picker.preamble': 'Add a note',
+			'picker.preambleHint': 'Put a short note in front of the quoted text, telling DeepSeek what it is and where it came from.',
+			'picker.preambleText': 'Below are excerpts from a conversation I had with another AI assistant (DSH), quoted as background. Lines starting with "> " are the original text, and 【...】 marks who that piece came from (user, assistant, question, answer, tool call, and so on). Please read them for context, then answer my question at the very end; say so if anything in the background is unclear.',
+			'picker.lastCount': 'How many',
+			'picker.question': 'Question or instruction to send along (optional)',
+			'picker.questionPlaceholder': 'e.g. Based on the above, help me draft a more complete plan.',
+			'picker.preview': 'What will be sent to DeepSeek',
+			'picker.hint': 'Fill and send puts the preview straight into DeepSeek and submits it; use Fill only if you want to check it first. Neither touches your DSH conversation.',
+			'toast.sent': 'Sent to DeepSeek ({count} chars).',
+			'toast.sendPending': 'Filled the DeepSeek composer, but the automatic send did not take — press Enter there yourself.',
+			'status.bound': 'Bound to DeepSeek conversation {id}',
+			'status.unbound': 'Unbound — binds automatically after the first message is sent in DeepSeek',
+			'status.nobridge': 'No desktop browser channel here, so the real web app cannot be embedded.',
+			'status.nobridgeHint': 'Use the DSH desktop app; a plain `dsh web` profile does not carry this channel.',
+			'status.failed': 'Embedding failed: {error}',
+			'status.filling': 'Filling…',
+			'toast.filled': 'Filled the DeepSeek composer ({count} chars) — press Enter yourself to send.',
+			'toast.nocomposer': 'No DeepSeek composer found. Open a conversation in the page first.',
+			'toast.copied': 'Copied to the clipboard.',
+			'toast.rebound': 'Binding cleared; the next visit starts a new conversation.',
+		}
+
+		//#region urls
+
+		/**
+		 * The DeepSeek conversation URL for one conversation id.
+		 * @param sessionId - DeepSeek conversation id.
+		 * @returns the absolute URL.
+		 */
+		function conversationUrl(sessionId) {
+			return PAGE_URL + 'a/' + AGENT_ID + '/s/' + encodeURIComponent(sessionId)
+		}
+
+		/**
+		 * Reduce a DSH Session id to the one form everything else compares against.
+		 *
+		 * DSH names the same Session two ways — the bare uuid that events carry
+		 * (`e07a9659-…`) and the `session-e07a9659-…` form its store uses — and
+		 * which one arrives here depends on the caller. The host canonicalises
+		 * what it stores, so comparing a raw id against the host's answer would
+		 * silently mismatch and make a bound Session look unbound.
+		 * @param value - a Session id in either form.
+		 * @returns the canonical id, or '' when there is none.
+		 */
+		function canonicalSessionId(value) {
+			if (typeof value !== 'string') return ''
+			const trimmed = value.trim()
+			if (trimmed === '') return ''
+			return trimmed.startsWith('session-') ? trimmed.slice('session-'.length) : trimmed
+		}
+
+		/**
+		 * The DeepSeek conversation id inside a chat.deepseek.com URL.
+		 * @param value - any URL string.
+		 * @returns the conversation id, or undefined.
+		 */
+		function sessionIdOf(value) {
+			if (typeof value !== 'string' || value === '') return undefined
+			let url
+			try {
+				url = new URL(value)
+			} catch (error) {
+				return undefined
+			}
+			if (url.hostname !== 'chat.deepseek.com') return undefined
+			const match = /^\/a\/[^/]+\/s\/([^/?#]+)\/?$/.exec(url.pathname)
+			if (match === null) return undefined
+			try {
+				return decodeURIComponent(match[1])
+			} catch (error) {
+				return match[1]
+			}
+		}
+
+		/**
+		 * @param id - a site id.
+		 * @returns that site, or the default one for an unknown id.
+		 */
+		function siteById(id) {
+			return SITE_BY_ID[typeof id === 'string' ? id : ''] ?? SITE_BY_ID[DEFAULT_SITE_ID]
+		}
+
+		/**
+		 * The web-chat site a URL belongs to, matching its host and subdomains.
+		 * @param value - any URL string.
+		 * @returns the site, or undefined for an unrelated origin.
+		 */
+		function siteOfUrl(value) {
+			if (typeof value !== 'string' || value === '') return undefined
+			let url
+			try {
+				url = new URL(value)
+			} catch (error) {
+				return undefined
+			}
+			const host = url.hostname.toLowerCase()
+			for (const site of SITES) {
+				if (host === site.host || host.endsWith('.' + site.host)) return site
+			}
+			return undefined
+		}
+
+		/** @returns the remembered site id. */
+		function readPersistedSite() {
+			try {
+				const value = globalThis.localStorage?.getItem(SITE_KEY)
+				return SITE_BY_ID[value] === undefined ? DEFAULT_SITE_ID : value
+			} catch (error) {
+				return DEFAULT_SITE_ID
+			}
+		}
+
+		/** @param id - the site id to remember. */
+		function persistSite(id) {
+			try {
+				globalThis.localStorage?.setItem(SITE_KEY, siteById(id).id)
+			} catch (error) {
+				// A blocked storage only costs the preference, not the panel.
+			}
+		}
+
+		//#endregion
+
+		//#region copy
+
+		/**
+		 * Interpolate `{name}` placeholders.
+		 * @param template - the copy string.
+		 * @param values - substitution values.
+		 * @returns the filled string.
+		 */
+		function format(template, values) {
+			return String(template).replace(/\{(\w+)\}/g, (whole, key) => (
+				Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : whole
+			))
+		}
+
+		/**
+		 * The copy function to use when the framework's `t` seat is absent.
+		 *
+		 * A registration that declares `locale` receives a bound `t`, so this is
+		 * only a backstop — but it resolves real copy rather than rendering raw
+		 * keys like `action.send` if the seat ever fails to arrive.
+		 * @returns a translate function over this plugin's dictionaries.
+		 */
+		function fallbackTranslate() {
+			const language = typeof navigator === 'object' && typeof navigator.language === 'string'
+				? navigator.language
+				: 'en'
+			const dictionary = language.toLowerCase().startsWith('zh') ? zh : en
+			return (key, values) => {
+				const template = dictionary[key] ?? en[key] ?? key
+				return values === undefined ? template : format(template, values)
+			}
+		}
+
+		//#endregion
+
+		//#region guest plumbing
+
+		/** The live guest, once one has been reserved. */
+		let guest = null
+		/** In-flight reservation, so concurrent callers share one attempt. */
+		let acquiring = null
+		/** Why the guest could not be created, or ''. */
+		let failure = ''
+		/** The DSH Session the guest is currently following. */
+		let activeSessionId = undefined
+		/** The last URL observed, so a binding is only taken from a settled URL. */
+		let lastSeenUrl = ''
+		/** The site the panel is showing; also what the next open navigates to. */
+		let activeSiteId = readPersistedSite()
+		/** The site the guest was last seen on, so a redirect can be followed. */
+		let lastGuestSiteId = activeSiteId
+		/** Whether the host half stores one login snapshot per site (version 2). */
+		let sitesCapable = false
+		/** The last URL this plugin asked the guest for, honoured at `dom-ready`. */
+		let lastRequestedUrl = siteById(activeSiteId).url
+		/** True while the picker is open; the guest hides behind it. */
+		let overlaySuppressed = false
+		/** Subscribers told when the binding state changes. */
+		const watchers = new Set()
+		/** Session/conversation pairs already written, so polling does not rewrite. */
+		const boundPairs = new Set()
+
+		/** @returns a snapshot of the guest state for the UI. */
+		function guestState() {
+			return {
+				ready: guest !== null,
+				failure,
+				hasBridge: hasBridge(),
+				site: activeSiteId,
+				sites: SITES.map((site) => ({ id: site.id, label: site.label })),
+			}
+		}
+
+		/** In-flight capability probe, shared by every caller. */
+		let hostSitesProbe = null
+
+		/**
+		 * Ask the host half whether it stores one login snapshot per site.
+		 *
+		 * Version 1 of the host only knew DeepSeek. The browser half still works
+		 * against it: the dropdown switches sites, and only the DeepSeek snapshot
+		 * is read or written until the host half is updated.
+		 * @returns the capability once known.
+		 */
+		function probeHostSites() {
+			if (hostSitesProbe !== null) return hostSitesProbe
+			hostSitesProbe = (async () => {
+				try {
+					const response = await fetch(ROUTES.state, { method: 'GET' })
+					const payload = await response.json()
+					sitesCapable = payload?.sitesVersion === 2
+				} catch (error) {
+					sitesCapable = false
+				}
+				notify()
+				return sitesCapable
+			})()
+			return hostSitesProbe
+		}
+
+		/** @returns the capability probe, awaited before the first guest is created. */
+		function ensureHostSites() {
+			return probeHostSites()
+		}
+
+		/**
+		 * Show another web-chat site in the panel.
+		 * @param id - the site to show.
+		 */
+		async function switchSite(id) {
+			const site = siteById(id)
+			if (guest !== null) {
+				let current = ''
+				try {
+					current = guest.element.getURL()
+				} catch (error) {
+					current = ''
+				}
+				if (siteOfUrl(current)?.id === site.id) {
+					activeSiteId = site.id
+					persistSite(site.id)
+					notify()
+					return
+				}
+				// Keep the site being left signed in where the host can store it.
+				try {
+					await saveGuestSession(true)
+				} catch (error) {
+					// A snapshot that fails costs a login, not the panel.
+				}
+			}
+			activeSiteId = site.id
+			lastGuestSiteId = site.id
+			lastRequestedUrl = site.url
+			lastSeenUrl = ''
+			persistSite(site.id)
+			notify()
+			if (guest === null) {
+				void ensureGuest()
+				return
+			}
+			navigate(site.url)
+		}
+
+		/**
+		 * Follow the guest's own navigation (redirects included) so the toolbar
+		 * shows the site it actually landed on.
+		 * @param element - the live webview.
+		 */
+		function syncSiteFromUrl(element) {
+			let url
+			try {
+				url = element.getURL()
+			} catch (error) {
+				return
+			}
+			const site = siteOfUrl(url)
+			if (site === undefined || site.id === lastGuestSiteId) return
+			lastGuestSiteId = site.id
+			if (site.id === activeSiteId) return
+			activeSiteId = site.id
+			persistSite(site.id)
+			notify()
+		}
+
+		/** Notify every subscriber that the guest state changed. */
+		function notify() {
+			diag.notify += 1
+			diagEvent('notify', { n: diag.notify })
+			for (const watcher of [...watchers]) {
+				try {
+					watcher()
+				} catch (error) {
+					// A broken subscriber must not stop the others.
+				}
+			}
+		}
+
+		/** A pending coalesced notify, so a burst of events re-renders once. */
+		let notifyQueued = false
+
+		/**
+		 * Counters for the diagnostics route.
+		 *
+		 * The guest is a `<webview>` this plugin cannot inspect from outside, so a
+		 * flicker in there is otherwise invisible: the only way to tell a real
+		 * hide/show cycle from a merely redundant one is to count them in the page
+		 * and read the numbers back.
+		 */
+		const diag = {
+			update: 0,
+			shown: 0,
+			hidden: 0,
+			moved: 0,
+			skipped: 0,
+			misses: 0,
+			hits: 0,
+			notify: 0,
+			// A flicker is either the guest being hidden and shown in a loop, or the
+			// panel body being torn down and remounted by the shell. These tell those
+			// apart, which no snapshot of the counters above can.
+			mounts: 0,
+			unmounts: 0,
+			renders: 0,
+			flickers: 0,
+			/** How long the last hide took, in ms: the suspect for a blocked window. */
+			lastHideMs: 0,
+			events: [],
+		}
+
+		/** Recent visibility flips, so a flicker can be detected as a rate. */
+		const flipTimes = []
+
+		/**
+		 * Whether the diagnostics channel is collecting.
+		 *
+		 * Off unless asked for. It exists to make a flicker in the guest measurable
+		 * from outside, which was worth a layout read and a JSON POST every second
+		 * while diagnosing one — but not afterwards. Turn it on by loading the GUI
+		 * with `?diag=1` (or setting `localStorage['dsh-deepseek-webchat:diag']`).
+		 * The plugin behaves identically either way; only the reporting differs.
+		 */
+		const diagnosticsOn = diagnosticsEnabled()
+
+		/**
+		 * Whether the diagnostics channel is collecting.
+		 *
+		 * On by default, because it is measured to be cheap — a layout read and a
+		 * 1 KB POST every couple of seconds, a few microseconds — and it is the only
+		 * way to see inside the guest, which is a `<webview>` this plugin cannot
+		 * otherwise inspect. It was briefly made opt-in on the theory that it caused
+		 * the lag; measurement disproved that, and switching off the instrument
+		 * while still hunting the problem was the wrong trade. `?diag=0`, or
+		 * localStorage `'dsh-deepseek-webchat:diag' = '0'`, turns it off.
+		 * @returns whether diagnostics were requested for this page load.
+		 */
+		function diagnosticsEnabled() {
+			try {
+				const query = new URLSearchParams(location.search).get('diag')
+				if (query === '0' || query === 'off') return false
+				if (query !== null) return true
+				return globalThis.localStorage?.getItem('dsh-deepseek-webchat:diag') !== '0'
+			} catch (error) {
+				return true
+			}
+		}
+
+		/**
+		 * Record a visibility flip, and flag a burst.
+		 *
+		 * A flicker is a rate, so one reading of the counters cannot show it — they
+		 * have to be read against the clock. Three flips within two seconds is taken
+		 * as a burst.
+		 * @param kind - `show` or `hide`.
+		 * @param detail - whatever the caller knows about this flip.
+		 */
+		function noteFlip(kind, detail) {
+			if (!diagnosticsOn) return
+			const now = Date.now()
+			flipTimes.push(now)
+			while (flipTimes.length > 0 && now - flipTimes[0] > 2000) flipTimes.shift()
+			if (flipTimes.length < 3) return
+			diag.flickers += 1
+			diagEvent('FLICKER', { kind, flips: flipTimes.length, ...detail })
+		}
+
+		/** Record one visibility transition, keeping only the recent tail. */
+		function diagEvent(kind, detail) {
+			// Cheap early-out when diagnostics are off: this is called on every
+			// parking pass and every notify, and building an event object plus a
+			// Date.now() each time is pure overhead in normal use.
+			if (!diagnosticsOn) return
+			diag.events.push({ t: Date.now(), kind, detail })
+			if (diag.events.length > 40) diag.events.splice(0, diag.events.length - 40)
+		}
+
+		/** Post the counters so the host can serve them from the diag route. */
+		function postDiagnostics(extra) {
+			if (!diagnosticsOn) return
+			try {
+				void fetch(ROUTES.diag, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ ...diag, ...extra }),
+				}).catch(() => undefined)
+			} catch (error) {
+				// Diagnostics must never break the plugin.
+			}
+		}
+
+		/**
+		 * Notify at most once per frame.
+		 *
+		 * A single page load raises several of the events that call this
+		 * (`did-navigate`, `did-navigate-in-page`, `did-finish-load`, plus the
+		 * poll), and each one re-rendered the whole panel. Coalescing them keeps a
+		 * burst from being a burst of renders — which is what a flicker is.
+		 */
+		function notifySoon() {
+			if (notifyQueued) return
+			notifyQueued = true
+			queueMicrotask(() => {
+				notifyQueued = false
+				notify()
+			})
+		}
+
+		/** @returns the desktop browser bridge, or undefined off the desktop shell. */
+		function bridge() {
+			const carrier = globalThis.dshDesktop
+			if (carrier === null || carrier === undefined) return undefined
+			if (carrier.protocolVersion !== 1) return undefined
+			const browser = carrier.browser
+			if (browser === null || browser === undefined) return undefined
+			if (typeof browser.acquire !== 'function') return undefined
+			return browser
+		}
+
+		/** @returns whether the desktop browser channel is available. */
+		function hasBridge() {
+			return bridge() !== undefined
+		}
+
+		/**
+		 * A plain Chrome user agent for the guest, derived from this renderer's
+		 * own so the Chrome major version stays truthful.
+		 *
+		 * chat.deepseek.com greets an `electron` token in the user agent with an
+		 * "使用环境异常 / Abnormal usage environment" dialog, and dismissing it is
+		 * stored per guest partition — process-lifetime here, so it would come
+		 * back on every restart. Its check is literally
+		 * `navigator.userAgent.toLowerCase().includes("electron")`, so not
+		 * advertising Electron is what keeps the page clean.
+		 * @returns a Chrome user agent, or '' when this renderer reports none.
+		 */
+		function cleanUserAgent() {
+			const ua = typeof navigator === 'object' && typeof navigator.userAgent === 'string'
+				? navigator.userAgent
+				: ''
+			const platform = (ua.match(/^Mozilla\/5\.0 \([^)]*\)/) || [])[0]
+			const chrome = (ua.match(/Chrome\/([0-9]+)/) || [])[1]
+			if (platform === undefined || chrome === undefined) return ''
+			return platform + ' AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chrome + '.0.0.0 Safari/537.36'
+		}
+
+		/**
+		 * Inject this plugin's stylesheet once.
+		 *
+		 * Colours come from the shell's own design tokens (`--dsw-*`), which is
+		 * what makes the panel and its header door sit in the same visual system
+		 * as the built-in UI. Every token is paired with a literal fallback: the
+		 * `--dsh-color-*` family this file used to reference does not exist in
+		 * DSH at all, so those declarations were silently falling through to
+		 * `inherit` and rendering the header glyph pure white instead of the
+		 * muted ink the rest of that row uses.
+		 */
+		function ensureStyle() {
+			if (document.querySelector('style[' + OVERLAY_ATTR + '-style]') !== null) return
+			const tag = document.createElement('style')
+			tag.setAttribute(OVERLAY_ATTR + '-style', '')
+			tag.textContent = [
+				// The persistent guest, parked on the measured slot area.
+				// The guest container is taken out of the page's layout, so showing it
+				// cannot change what the pane it covers measures. That matters because
+				// the parking code decides whether to show the guest from that very
+				// rectangle, and a container that perturbs it set up a
+				// show/measure-zero/hide/measure-real oscillation.
+				'[' + OVERLAY_ATTR + ']{position:fixed;display:none;z-index:40;overflow:hidden;background:#fff;contain:layout size paint style}',
+				'[' + OVERLAY_ATTR + '] webview{-webkit-app-region:no-drag;border:0;display:flex;width:100%;height:100%}',
+				// The panel itself.
+				'.dswc-root{display:flex;flex-direction:column;width:100%;height:100%;min-height:0;font-size:12px;color:var(--dsw-alias-label-primary,inherit)}',
+				// The toolbar carries the panel's top rule, so its height is not a taste
+				// decision: the shell puts the conversation header's horizontal line at
+				// the bottom of a 38px tab strip (`_tabStrip` is `height:28px;
+				// padding:10px 6px 0`), and every sidebar tab the shell ships opens with
+				// a `height:38px; border-bottom:.5px` header. A tab body starts at y=38,
+				// so a 38px header puts its rule at 76 — the same row as the
+				// conversation's. Measured against the live app: 6px of padding around
+				// 24px buttons plus a 1px border came to 36px, leaving this rule two
+				// pixels above the one it is meant to continue.
+				'.dswc-toolbar{box-sizing:border-box;display:flex;align-items:center;gap:6px;height:38px;padding:0 8px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(128,128,128,.24));flex:none}',
+				'.dswc-status{font-size:11px;line-height:1;color:var(--dsw-alias-label-tertiary,#adb2b8)}',
+				'.dswc-status[data-state="bound"]{color:#2ea043}',
+				'.dswc-status[data-state="error"]{color:#d1242f}',
+				'.dswc-status[data-state="site"]{color:var(--dsw-alias-label-tertiary,#adb2b8)}',
+				'.dswc-select{font:inherit;font-size:11px;height:22px;max-width:120px;padding:0 4px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.35));background:transparent;color:inherit;cursor:pointer}',
+				'.dswc-select:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}',
+				'.dswc-gap{flex:1 1 auto}',
+				'.dswc-button{font:inherit;font-size:11px;padding:3px 8px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.35));background:transparent;color:inherit;cursor:pointer;white-space:nowrap}',
+				'.dswc-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12))}',
+				'.dswc-button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}',
+				'.dswc-button:disabled{opacity:.45;cursor:default}',
+				'.dswc-primary{border-color:transparent;background:var(--dsw-alias-state-business-primary,#4d6bfe);color:#fff}',
+				'.dswc-primary:hover:not(:disabled){background:var(--dsw-alias-state-business-primary,#4d6bfe);opacity:.88}',
+				'.dswc-host{position:relative;flex:1 1 auto;min-height:0}',
+				'.dswc-picker{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;gap:6px;padding:8px}',
+				'.dswc-pickerHead{display:flex;align-items:center;gap:6px;row-gap:4px;flex-wrap:wrap;flex:none}',
+				'.dswc-pickerTitle{font-weight:600}',
+				'.dswc-muted{color:var(--dsw-alias-label-tertiary,#adb2b8);font-size:11px}',
+				'.dswc-more{position:sticky;top:0;display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--dsw-alias-bg-layer-1,#fff);border-bottom:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.25))}',
+				'.dswc-list{flex:1 1 auto;min-height:60px;overflow:auto;border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.25));border-radius:var(--dsw-radius-md,12px)}',
+				'.dswc-row{display:flex;gap:6px;padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.15))}',
+				'.dswc-row:last-child{border-bottom:0}',
+				'.dswc-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08))}',
+				// The row marker is an icon from the shell's own set plus a short
+				// word, inside a fixed-width column so the text of every row starts
+				// at the same place however long the label is.
+				'.dswc-role{display:inline-flex;align-items:center;gap:4px;flex:none;width:58px;font-size:10px;line-height:1.2;color:var(--dsw-alias-label-tertiary,#adb2b8);padding-top:1px}',
+				'.dswc-kindIcon{flex:none;display:block}',
+				'.dswc-roleLabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+				// A question and its answer are what the default set exists for, so
+				// their markers carry the accent ink the answer badge uses. The
+				// assistant's row uses it too: its marker is DeepSeek's own logo,
+				// which is a solid mark and reads as a grey blob when muted.
+				'.dswc-row[data-kind="question"] .dswc-role,.dswc-row[data-kind="answer"] .dswc-role{color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
+				'.dswc-row[data-kind="assistant"] .dswc-role{color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
+				'.dswc-select{font:inherit;font-size:11px;padding:2px 4px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.35));background:transparent;color:inherit}',
+				// Advanced rows are the machinery behind the conversation, so they
+				// are inked down rather than competing with the actual dialogue.
+				'.dswc-row[data-kind="reasoning"] .dswc-text,.dswc-row[data-kind="tool-call"] .dswc-text,.dswc-row[data-kind="tool-result"] .dswc-text,.dswc-row[data-kind="todo"] .dswc-text,.dswc-row[data-kind="command"] .dswc-text,.dswc-row[data-kind="summary"] .dswc-text{color:var(--dsw-alias-label-tertiary,#adb2b8);font-size:11px}',
+				'.dswc-row[data-kind="reasoning"] .dswc-text{font-style:italic}',
+				'.dswc-row[data-kind="tool-call"] .dswc-text,.dswc-row[data-kind="tool-result"] .dswc-text,.dswc-row[data-kind="command"] .dswc-text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}',
+				// The question and its answer are the point of the default set, so
+				// they read as slightly more than the surrounding dialogue.
+				'.dswc-row[data-kind="question"] .dswc-text{color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
+				'.dswc-advanced{display:flex;align-items:center;gap:6px;flex:none;font-size:11px;color:var(--dsw-alias-label-tertiary,#adb2b8);cursor:pointer}',
+				'.dswc-advanced:hover{color:var(--dsw-alias-label-secondary,#cfd3d6)}',
+				'.dswc-text{flex:1 1 auto;white-space:pre-wrap;word-break:break-word;max-height:96px;overflow:hidden}',
+				'.dswc-compose{display:flex;flex-direction:column;gap:4px;flex:none}',
+				'.dswc-label{font-size:11px;color:var(--dsw-alias-label-tertiary,#adb2b8)}',
+				'.dswc-question,.dswc-preview{font:inherit;width:100%;box-sizing:border-box;padding:6px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.3));background:transparent;color:inherit;resize:vertical}',
+				'.dswc-preview{margin:0;max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}',
+				'.dswc-actions{display:flex;gap:6px}',
+				'.dswc-notice{padding:12px;color:var(--dsw-alias-label-tertiary,#adb2b8);display:flex;flex-direction:column;gap:6px}',
+				'.dswc-toast{flex:none;margin:0 8px 8px;padding:6px 8px;border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14));font-size:11px}',
+				// The header door. Sized and inked like the built-in icon buttons in
+				// that row (24px hit area, 8px radius, muted ink, translucent hover),
+				// rather than inheriting the header's near-white text colour.
+				'.dswc-headerButton{box-sizing:border-box;display:inline-flex;flex:none;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary,#cfd3d6);cursor:pointer}',
+				'.dswc-headerButton:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08));color:var(--dsw-alias-label-primary,#fff)}',
+				'.dswc-headerButton:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}',
+			].join('\n')
+			document.head.appendChild(tag)
+		}
+
+		/**
+		 * @returns the document-root container that keeps the guest alive.
+		 *
+		 * The stylesheet is injected first, and that is not incidental: without the
+		 * `position: fixed` rule this element is an ordinary block-level div, so a
+		 * bare one appended to `<body>` claims the full document width and shoves
+		 * the whole app sideways — and the guest's own white page sits on top of it.
+		 * That is the "the entire page flashes" symptom, and it appeared whenever the
+		 * guest was rebuilt before the sheet existed.
+		 */
+		function overlayContainer() {
+			ensureStyle()
+			const existing = document.querySelector('[' + OVERLAY_ATTR + ']')
+			if (existing !== null && existing !== undefined) return existing
+			const box = document.createElement('div')
+			box.setAttribute(OVERLAY_ATTR, '')
+			// Hidden at birth so there is never a frame where it is in the document
+			// and visible but not yet sized.
+			box.style.display = 'none'
+			document.body.appendChild(box)
+			return box
+		}
+
+		/**
+		 * Hide the guest without unmounting it.
+		 *
+		 * Idempotent on purpose: setting `display` on a `<webview>` that is already
+		 * in that state still makes the guest re-composite, which reads as a
+		 * flicker. Any redundant pass over the parking code must therefore be a
+		 * no-op rather than a hide/show cycle.
+		 */
+		function hideOverlay() {
+			if (guest === null) return
+			if (guest.container.style.display === 'none') {
+				diag.skipped += 1
+				return
+			}
+			diag.hidden += 1
+			diagEvent('hide')
+			noteFlip('hide')
+			// Timed because hiding a guest running a full SPA is the one operation
+			// here that can plausibly block the window, and a report of "it freezes
+			// when I open the picker" has to be attributable to a specific step.
+			const t0 = Date.now()
+			guest.container.style.display = 'none'
+			const ms = Date.now() - t0
+			diag.lastHideMs = ms
+			if (ms > 4) diagEvent('hide:slow', { ms })
+		}
+
+		/**
+		 * Park the guest on one measured rectangle.
+		 *
+		 * The order here is load-bearing. The container is `position: fixed` with a
+		 * white background, and a block-level fixed box with `width: auto` spans the
+		 * whole viewport. Making it visible before its geometry is set therefore
+		 * paints a full-window white slab over the app for a frame — which is what
+		 * "the whole page flashes" was. Geometry first, visibility last.
+		 * @param rect - the slot area, in viewport coordinates.
+		 */
+		function showOverlay(rect) {
+			if (guest === null) return
+			const style = guest.container.style
+			// A zero-sized rectangle is a pane that has not been laid out yet;
+			// parking on it would show a sliver, so wait for the next pass.
+			if (!(rect.width > 0) || !(rect.height > 0)) return
+			// Rounded to whole pixels before anything is written.
+			//
+			// `getBoundingClientRect()` returns fractions (705.4000244140625), while
+			// the style object hands back the browser's own normalised form. Comparing
+			// the raw float string against that never matches, so every single pass
+			// looked like a change and rewrote all four properties — and on a
+			// `<webview>` a geometry write re-composites. Four writes a second is the
+			// flicker that was still visible after the hide/show loop was fixed.
+			// Rounding makes an unchanged rectangle compare equal, so it is written
+			// once and then left alone.
+			//
+			// *Which way* it rounds is load-bearing: inward (ceil the near edges,
+			// floor the far ones), never `Math.round`.
+			//
+			// The right column does not start on a whole CSS pixel — the dock is a
+			// `1fr` grid track — and the pane it hosts carries the `.5px`
+			// `border-left` that is the vertical divider between the conversation and
+			// the sidebar. At this machine's 1.25 device scale that hairline is one
+			// device pixel, 0.625 CSS px. `Math.round` moves the overlay's left edge
+			// *left* by up to half a CSS pixel whenever the pane lands on x.5–x.99, so
+			// this opaque container covers exactly that device pixel and the divider
+			// disappears. Measured in the live app: with the overlay parked at
+			// `Math.round(rect.left)`, `elementFromPoint` on the border pixel returns
+			// the overlay instead of the pane. Only a tab body that parks something
+			// over the whole pane — this plugin — can lose the line; every other tab
+			// paints strictly inside its border box.
+			//
+			// Rounding inward keeps the overlay a subset of the measured rectangle, so
+			// the border is never painted over. The cost is at most one pixel of
+			// unused extent, invisible against the same background.
+			const leftEdge = Math.ceil(rect.left)
+			const topEdge = Math.ceil(rect.top)
+			const rightEdge = Math.floor(rect.left + rect.width)
+			const bottomEdge = Math.floor(rect.top + rect.height)
+			// A sub-pixel pane rounds to an empty box; refusing to park is better
+			// than parking on nothing.
+			if (rightEdge - leftEdge < 1 || bottomEdge - topEdge < 1) return
+			const left = leftEdge + 'px'
+			const top = topEdge + 'px'
+			const width = (rightEdge - leftEdge) + 'px'
+			const height = (bottomEdge - topEdge) + 'px'
+			const moved = style.left !== left || style.top !== top
+				|| style.width !== width || style.height !== height
+			// Written only when it actually changed.
+			if (style.left !== left) style.left = left
+			if (style.top !== top) style.top = top
+			if (style.width !== width) style.width = width
+			if (style.height !== height) style.height = height
+			// Only now, with a real size in place, is it safe to show.
+			if (style.display !== 'block') {
+				diag.shown += 1
+				diagEvent('show', { left, top, width, height })
+				noteFlip('show', { width, height })
+				style.display = 'block'
+			} else if (moved) {
+				diag.moved += 1
+				diagEvent('move', { left, top, width, height })
+			} else {
+				diag.skipped += 1
+			}
+		}
+
+		/**
+		 * Suppress or release the guest while the picker is open.
+		 * @param value - whether the picker is showing.
+		 */
+		function setOverlaySuppressed(value) {
+			overlaySuppressed = value
+			if (value) hideOverlay()
+		}
+
+		/**
+		 * Ask the host for a site's saved login before the site is restored.
+		 * @param site - the site whose snapshot is wanted.
+		 * @returns the stored state, or null when there is none.
+		 */
+		async function restoreGuestSession(site) {
+			const id = siteById(site).id
+			// A version-1 host only knows DeepSeek: never feed its snapshot to
+			// another site, and never ask it to label one it cannot.
+			if (!sitesCapable && id !== 'deepseek') return null
+			try {
+				const url = sitesCapable
+					? ROUTES.sessionRestore + '?site=' + encodeURIComponent(id)
+					: ROUTES.sessionRestore
+				const response = await fetch(url, { method: 'POST' })
+				const payload = await response.json()
+				if (payload === null || typeof payload !== 'object') return null
+				const storage = Array.isArray(payload.storage) ? payload.storage : []
+				const cookie = typeof payload.cookie === 'string' ? payload.cookie : ''
+				if (storage.length === 0 && cookie === '') return null
+				return { storage, cookie }
+			} catch (error) {
+				return null
+			}
+		}
+
+		/**
+		 * Read the guest's own storage and cookie string.
+		 *
+		 * That string cannot carry HttpOnly cookies, but DeepSeek keeps its
+		 * credential in `localStorage.userToken` and sends it as a bearer token,
+		 * so replaying site storage is what actually restores a login.
+		 * @param element - the live webview.
+		 * @returns the guest state as JSON text.
+		 */
+		function readGuestState(element) {
+			return element.executeJavaScript(
+				'JSON.stringify({ storage: Object.keys(localStorage).map(function (key) { return [key, localStorage.getItem(key)] }), cookie: document.cookie })',
+			)
+		}
+
+		/**
+		 * Write a guest state back into the page.
+		 * @param element - the live webview.
+		 * @param state - `{ storage, cookie }`.
+		 */
+		function writeGuestState(element, state) {
+			return element.executeJavaScript(
+				'(function () { var state = ' + JSON.stringify(state) + ';'
+				+ ' var storage = Array.isArray(state.storage) ? state.storage : [];'
+				+ ' for (var i = 0; i < storage.length; i++) { try { localStorage.setItem(storage[i][0], storage[i][1]) } catch (error) {} }'
+				+ " if (typeof state.cookie === 'string' && state.cookie !== '') {"
+				+ " var parts = state.cookie.split('; ');"
+				+ ' for (var j = 0; j < parts.length; j++) {'
+				+ ' var pair = parts[j];'
+				+ " if (pair.indexOf('=') === -1) continue;"
+				+ " try { document.cookie = pair + '; path=/' } catch (error) {}"
+				+ ' } }'
+				+ ' return true })()',
+			)
+		}
+
+		/**
+		 * Whether a guest element is currently on the DeepSeek origin.
+		 *
+		 * This guard is what protects the saved login. The guest starts on
+		 * `about:blank#<lease>` and reaches DeepSeek a navigation later, so an
+		 * early `did-finish-load` can fire while the page is still on the opaque
+		 * origin — where `localStorage` throws and `document.cookie` is empty.
+		 * Reading state there would return nothing, and saving that nothing would
+		 * overwrite the snapshot the next launch needs. So both directions of the
+		 * snapshot are confined to the real origin.
+		 * @param element - the live webview.
+		 * @returns true when its URL is on chat.deepseek.com.
+		 */
+		function onDeepSeekOrigin(element) {
+			try {
+				return new URL(element.getURL()).hostname === 'chat.deepseek.com'
+			} catch (error) {
+				return false
+			}
+		}
+
+		/**
+		 * Ask the host to refresh the stored login snapshot.
+		 *
+		 * The partition is deliberately not sent: it is a fresh
+		 * `dsh-sidebar-browser-<uuid>` every run, so it identifies nothing across
+		 * restarts and the snapshot is keyed to this plugin instead.
+		 * @param withState - whether to include what only the guest can read.
+		 */
+		async function saveGuestSession(withState) {
+			if (guest === null) return
+			let currentUrl = ''
+			try {
+				currentUrl = guest.element.getURL()
+			} catch (error) {
+				return
+			}
+			// Never let an off-site read blank a snapshot, and never write a site
+			// the host cannot label (a version-1 host only understands DeepSeek).
+			const site = siteOfUrl(currentUrl)
+			if (site === undefined) return
+			if (!sitesCapable && site.id !== 'deepseek') return
+			let state = null
+			if (withState) {
+				try {
+					state = JSON.parse(await readGuestState(guest.element))
+				} catch (error) {
+					// Not ready: keep whatever the host already has.
+					return
+				}
+			}
+			try {
+				await fetch(ROUTES.sessionSave, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({
+						site: site.id,
+						storage: Array.isArray(state?.storage) ? state.storage : [],
+						cookie: typeof state?.cookie === 'string' ? state.cookie : '',
+					}),
+				})
+			} catch (error) {
+				// Best effort: a snapshot that fails costs a login, not the page.
+			}
+		}
+
+		/**
+		 * Record one DSH Session → DeepSeek conversation binding.
+		 *
+		 * The host is the authority, not this cache: the cache only exists so the
+		 * poll does not re-POST the same pair every couple of seconds (each write
+		 * notifies the panel and re-renders it). So the host's answer is what the
+		 * cache is reconciled against — if the host says this Session is now
+		 * bound to a different conversation, the cache follows rather than
+		 * insisting on the stale pair.
+		 *
+		 * Re-binding is allowed and is the point: when the user's conversation in
+		 * the page changes, the Session should follow the new one. The host
+		 * refuses only a conversation another Session already owns.
+		 * @param dshSessionId - DSH Session id.
+		 * @param deepseekSessionId - DeepSeek conversation id.
+		 */
+		async function bind(rawSessionId, deepseekSessionId) {
+			const dshSessionId = canonicalSessionId(rawSessionId)
+			if (dshSessionId === '') return
+			const pair = dshSessionId + '\u0000' + deepseekSessionId
+			if (boundPairs.has(pair)) return
+			try {
+				const response = await fetch(ROUTES.binding, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ dshSessionId, deepseekSessionId }),
+				})
+				const payload = await response.json()
+				if (payload?.ok !== true) {
+					// Refused — the conversation belongs to another Session. Leave
+					// the claim off so a later observation can retry, and do not
+					// mark it as bound.
+					return
+				}
+				// The host echoes the binding it now holds, so the cache records
+				// what is actually stored rather than what was merely requested.
+				const stored = typeof payload.deepseekSessionId === 'string'
+					? payload.deepseekSessionId
+					: deepseekSessionId
+				boundPairs.add(dshSessionId + '\u0000' + stored)
+				notifySoon()
+			} catch (error) {
+				// The next observation retries, so leave the claim off.
+			}
+		}
+
+		/**
+		 * Forget the write cache for one DSH Session.
+		 *
+		 * The prefix is canonicalised to match how `bind` keys the cache; a raw id
+		 * here would leave the entry behind, and the next visit would be silently
+		 * treated as "already bound" and never re-registered.
+		 * @param dshSessionId - DSH Session id, in either form.
+		 */
+		function forgetBoundPairs(dshSessionId) {
+			const canonical = canonicalSessionId(dshSessionId)
+			if (canonical === '') return
+			const prefix = canonical + '\u0000'
+			for (const pair of [...boundPairs]) {
+				if (pair.startsWith(prefix)) boundPairs.delete(pair)
+			}
+		}
+
+		/**
+		 * @param dshSessionId - DSH Session id.
+		 * @returns the bound DeepSeek conversation id, or null.
+		 */
+		async function readBinding(dshSessionId) {
+			if (typeof dshSessionId !== 'string' || dshSessionId === '') return null
+			try {
+				const response = await fetch(
+					ROUTES.binding + '?sessionId=' + encodeURIComponent(dshSessionId),
+				)
+				const payload = await response.json()
+				const value = payload?.deepseekSessionId
+				return typeof value === 'string' && value !== '' ? value : null
+			} catch (error) {
+				return null
+			}
+		}
+
+		/**
+		 * Observe the guest's URL, requiring it to have settled before trusting it.
+		 *
+		 * DeepSeek creates a conversation only when the first message is sent, so
+		 * the id appears by navigation rather than by any API this plugin can
+		 * call. Requiring two identical readings keeps a transient URL during a
+		 * session switch from being bound to the wrong DSH Session.
+		 *
+		 * The settle counter is deliberately *not* reset by the ordinary polling
+		 * path — only by a deliberate navigation — so that a page which is simply
+		 * sitting still does reach its second reading.
+		 */
+		function observeUrl() {
+			if (guest === null || activeSessionId === undefined) return
+			let url
+			try {
+				url = guest.element.getURL()
+			} catch (error) {
+				return
+			}
+			if (url === '' || url === 'about:blank') return
+			if (url !== lastSeenUrl) {
+				lastSeenUrl = url
+				return
+			}
+			const deepseekSessionId = sessionIdOf(url)
+			if (deepseekSessionId === undefined) return
+			// Only adopt a conversation nobody owns.
+			//
+			// Binding unconditionally here re-pointed the active Session at whatever
+			// the guest happened to be showing. During a restore that is the *old*
+			// conversation — the navigation to the right one has not landed yet — so
+			// the poll undid the restore and the binding looked broken. A
+			// conversation another Session owns is never adopted; focusSession is
+			// what decides those.
+			void adoptIfUnowned(activeSessionId, deepseekSessionId)
+		}
+
+		/**
+		 * Bind a conversation to a Session only when nobody owns it yet.
+		 *
+		 * A conversation already owned by *this* Session needs no write, and one
+		 * owned by another must not be stolen. The already-ours case is checked
+		 * against the write cache first, because this runs from the URL poll and
+		 * from every navigation event: without that, the steady state — the guest
+		 * sitting in the conversation this Session already owns — would cost a
+		 * round trip to the host every couple of seconds, for an answer that cannot
+		 * have changed.
+		 * @param dshSessionId - DSH Session id.
+		 * @param deepseekSessionId - DeepSeek conversation id.
+		 */
+		async function adoptIfUnowned(dshSessionId, deepseekSessionId) {
+			if (boundPairs.has(dshSessionId + '\u0000' + deepseekSessionId)) return
+			const owner = await ownerOf(deepseekSessionId)
+			if (owner !== null && owner !== dshSessionId) return
+			await bind(dshSessionId, deepseekSessionId)
+		}
+
+		/**
+		 * Point the guest at the conversation this DSH Session should be showing.
+		 *
+		 * Called when the DSH Session changes, and once on mount. The rule is that
+		 * an existing binding wins: a Session that already owns a conversation is
+		 * taken back to it, whatever the guest happens to be showing.
+		 *
+		 * Only a Session with no binding adopts what the guest is already displaying
+		 * (which is how its first message lands in the conversation already open).
+		 * Adopting is deliberately second, because DeepSeek redirects its root into
+		 * the user's last conversation, so the guest is frequently sitting somewhere
+		 * unowned when a switch arrives — and adopting then would re-point the
+		 * Session instead of restoring it.
+		 *
+		 * Following a conversation the user opens *within* a Session is observeUrl's
+		 * job: it sees the new URL and claims it if it is unowned.
+		 * @param rawSessionId - the DSH Session the guest should follow, in either
+		 *   id form.
+		 */
+		async function focusSession(rawSessionId) {
+			const dshSessionId = canonicalSessionId(rawSessionId)
+			if (dshSessionId === '') return
+			// Only the DeepSeek site has conversations to bind to DSH Sessions.
+			if (activeSiteId !== 'deepseek') return
+			activeSessionId = dshSessionId
+			if (guest === null) return
+			let current
+			try {
+				current = guest.element.getURL()
+			} catch (error) {
+				current = ''
+			}
+			const currentId = sessionIdOf(current)
+			const bound = await readBinding(dshSessionId)
+			// An existing binding wins, and this is the whole point of focusing.
+			//
+			// Adopting an unowned conversation used to be checked first, which meant
+			// a Session that already owned a conversation could have that binding
+			// silently replaced: DeepSeek redirects its root into the user's last
+			// conversation, so the guest frequently arrives somewhere unowned, and
+			// that branch would adopt it and re-point the Session instead of going
+			// back to its own conversation. That is the "binding failed" symptom.
+			//
+			// Following a conversation the user opens *within* a Session is
+			// observeUrl's job, not this one's: it sees the new URL and re-points
+			// the binding, so nothing is lost by restoring here.
+			if (bound !== null) {
+				if (currentId !== bound) navigate(conversationUrl(bound))
+				return
+			}
+			// No binding yet, so this Session has nothing to restore. Adopt what the
+			// guest is already showing, which is how a Session's first message lands
+			// in the conversation already open.
+			if (currentId === undefined) return
+			const owner = await ownerOf(currentId)
+			if (owner === null) {
+				await bind(dshSessionId, currentId)
+				return
+			}
+			// Another Session owns it and this one owns nothing: start fresh rather
+			// than typing into someone else's conversation.
+			navigate(PAGE_URL)
+		}
+
+		/**
+		 * @param deepseekSessionId - DeepSeek conversation id.
+		 * @returns the DSH Session that owns it, or null when unbound.
+		 */
+		async function ownerOf(deepseekSessionId) {
+			try {
+				const response = await fetch(
+					ROUTES.binding + '?deepseekSessionId=' + encodeURIComponent(deepseekSessionId),
+				)
+				const payload = await response.json()
+				const value = payload?.dshSessionId
+				return typeof value === 'string' && value !== '' ? value : null
+			} catch (error) {
+				return null
+			}
+		}
+
+		/**
+		 * Navigate the guest, tolerating a navigation already in flight.
+		 * @param url - absolute URL.
+		 */
+		function navigate(url) {
+			if (guest === null) return
+			lastSeenUrl = ''
+			lastRequestedUrl = url
+			try {
+				const pending = guest.element.loadURL(url)
+				if (pending !== undefined && typeof pending.catch === 'function') {
+					pending.catch(() => undefined)
+				}
+			} catch (error) {
+				// A navigation superseded by another one is not an error worth showing.
+			}
+		}
+
+		/**
+		 * Reserve a guest and attach its webview, once per app run.
+		 * @returns a promise resolving once the attempt settled.
+		 */
+		function ensureGuest() {
+			if (guest !== null) return Promise.resolve()
+			const browser = bridge()
+			if (browser === undefined) {
+				failure = ''
+				notify()
+				return Promise.resolve()
+			}
+			if (acquiring !== null) return acquiring
+			acquiring = (async () => {
+				try {
+					const reservation = await browser.acquire(WORKSPACE)
+					if (reservation === null || typeof reservation !== 'object'
+						|| typeof reservation.lease !== 'string'
+						|| typeof reservation.partition !== 'string') {
+						throw new Error('the desktop browser bridge returned no reservation')
+					}
+					await ensureHostSites()
+					const element = document.createElement('webview')
+					element.setAttribute('name', reservation.lease)
+					element.setAttribute('partition', reservation.partition)
+					element.setAttribute('src', 'about:blank#' + reservation.lease)
+					const userAgent = cleanUserAgent()
+					if (userAgent !== '') element.setAttribute('useragent', userAgent)
+					const record = {
+						lease: reservation.lease,
+						partition: reservation.partition,
+						element,
+						container: overlayContainer(),
+						restoredSites: new Set(),
+						restoringSite: '',
+						timer: 0,
+						poller: 0,
+					}
+					// The guest exists by `dom-ready` and nothing has been navigated
+					// yet, so this is the user agent the page actually loads with.
+					element.addEventListener('dom-ready', () => {
+						if (userAgent !== '') {
+							try {
+								element.setUserAgent(userAgent)
+							} catch (error) {
+								// The attribute above already covers most of it.
+							}
+						}
+						navigate(lastRequestedUrl)
+					}, { once: true })
+					// Storage and cookies can only be written while the page is on
+					// its own origin, so they are restored after a real site loads
+					// and the page is then asked to load once more — this time
+					// already signed in. The origin check matters: the guest's first
+					// document is `about:blank#<lease>`, where writing storage throws,
+					// and treating that as the restore would burn the one attempt.
+					//
+					// A snapshot is restored once per site and app run: the guest
+					// partition is per-run, so every site starts logged out on each
+					// launch and needs its own storage replayed before it settles.
+					element.addEventListener('did-finish-load', () => {
+						const site = siteOfUrl(element.getURL())
+						if (site === undefined || record.restoringSite !== '') return
+						if (record.restoredSites.has(site.id)) {
+							void saveGuestSession(true)
+							return
+						}
+						record.restoredSites.add(site.id)
+						record.restoringSite = site.id
+						void restoreGuestSession(site.id).then((snapshot) => {
+							record.restoringSite = ''
+							if (snapshot === null) return undefined
+							return Promise.resolve(writeGuestState(element, snapshot))
+								.then(() => {
+									element.reload()
+								})
+								.catch(() => undefined)
+						})
+					})
+					for (const event of ['did-navigate', 'did-navigate-in-page', 'did-finish-load']) {
+						element.addEventListener(event, () => {
+							// Follow a redirect so the toolbar shows the site the
+							// guest actually landed on, then let the URL settle before
+							// any conversation is adopted.
+							syncSiteFromUrl(element)
+							// A navigation means the URL is worth re-reading, but it
+							// must not clear the settle marker: the poll below settles
+							// by seeing the same URL twice, and wiping it on every
+							// event meant a still page never settled and its
+							// conversation was never bound.
+							observeUrl()
+						})
+					}
+					record.container.appendChild(element)
+					guest = record
+					record.timer = setInterval(() => {
+						void saveGuestSession(true)
+					}, SAVE_INTERVAL_MS)
+					record.poller = setInterval(observeUrl, URL_POLL_MS)
+					failure = ''
+				} catch (error) {
+					failure = error instanceof Error ? error.message : String(error)
+				} finally {
+					acquiring = null
+					notify()
+				}
+			})()
+			return acquiring
+		}
+
+		/** Release the guest and detach everything it owns. */
+		function disposeGuest() {
+			if (guest === null) return
+			const record = guest
+			guest = null
+			clearInterval(record.timer)
+			clearInterval(record.poller)
+			try {
+				record.element.remove()
+			} catch (error) {
+				// Already gone.
+			}
+			try {
+				record.container.remove()
+			} catch (error) {
+				// Already gone.
+			}
+			const browser = bridge()
+			if (browser !== undefined && typeof browser.release === 'function') {
+				try {
+					browser.release(record.lease)
+				} catch (error) {
+					// The shell owns the lease's real lifetime.
+				}
+			}
+			notify()
+		}
+
+		//#endregion
+
+		//#region composing
+
+		/**
+		 * One message as a blockquote block, so every line stays quoted.
+		 * @param label - the role label.
+		 * @param text - the message text.
+		 * @returns the blockquote, or '' for an empty message.
+		 */
+		function quoteBlock(label, text) {
+			const body = String(text).trim()
+			if (body === '') return ''
+			const lines = body.split(/\r?\n/)
+			return ['> 【' + label + '】' + lines[0]]
+				.concat(lines.slice(1).map((line) => '> ' + line))
+				.join('\n')
+		}
+
+		/**
+		 * Compose the blockquote plus the user's own question.
+		 * @param rows - the selected messages, in log order.
+		 * @param labels - role and kind labels.
+		 * @param question - the user's question or instruction.
+		 * @param options - `{ preamble }`, a note explaining what is being quoted.
+		 * @returns the text to place in the DeepSeek composer.
+		 */
+		function compose(rows, labels, question, options = {}) {
+			const blocks = []
+			for (const row of rows) {
+				// Every row is labelled by what it is, not just by who said it:
+				// once the advanced switch is on, a quoted tool result and a
+				// quoted answer would otherwise look identical in the blockquote.
+				const label = kindLabel(row, labels)
+				const block = quoteBlock(label, row.text)
+				if (block !== '') blocks.push(block)
+			}
+			const quoted = blocks.join('\n\n')
+			const asked = String(question ?? '').trim()
+			const note = String(options.preamble ?? '').trim()
+			const chunks = []
+			// The note explains the blockquotes, so it is pointless without them —
+			// a bare question needs no account of where it came from.
+			if (quoted !== '') chunks.push(note === '' ? quoted : note + '\n\n' + quoted)
+			if (asked !== '') chunks.push(asked)
+			return chunks.join('\n\n---\n\n')
+		}
+
+		/**
+		 * The label for one row, used both in the list and in the blockquote.
+		 * @param row - a picker row.
+		 * @param labels - `{ user, assistant, tool, kind }`.
+		 * @returns the label text.
+		 */
+		function kindLabel(row, labels) {
+			const kind = row.kind ?? row.role
+			if (kind === 'user') return labels.user
+			if (kind === 'assistant') return labels.assistant
+			// Every remaining kind has a two-character label, which is what keeps
+			// the role column a fixed narrow width in both locales.
+			return labels.kind?.[kind] ?? (row.role === 'tool' ? labels.tool : labels.assistant)
+		}
+
+		/**
+		 * The shell's own artwork for each row kind.
+		 *
+		 * Lifted from `@deepseek-ai/dsh-client-ui-primitives`, which is inlined
+		 * into every client bundle at build time and so cannot be `require`d at
+		 * runtime. Each glyph is drawn on that set's `0 0 16 16` grid and stroked
+		 * at the Regular 1px weight in `currentColor`, so a row marker reads as
+		 * one of the shell's icons rather than as a drawing of its own. Entries
+		 * that are objects are solid glyphs, because their source artwork is.
+		 */
+		const KIND_ARTWORK = {
+			user: [
+				'M8 8.25C9.51878 8.25 10.75 7.01878 10.75 5.5C10.75 3.98122 9.51878 2.75 8 2.75C6.48122 2.75 5.25 3.98122 5.25 5.5C5.25 7.01878 6.48122 8.25 8 8.25Z',
+				'M2.5 14.5C2.5 11.5 5.25 10.25 8 10.25C10.75 10.25 13.5 11.5 13.5 14.5',
+			],
+			assistant: [
+				'M5.875 3C5.875 6.33333 7.54167 8 10.875 8C7.54167 8 5.875 9.66667 5.875 13C5.875 9.66667 4.20833 8 0.875 8C4.20833 8 5.875 6.33333 5.875 3Z',
+				'M12.375 1.55823C12.375 3.39156 13.2917 4.30823 15.125 4.30823C13.2917 4.30823 12.375 5.22489 12.375 7.05823C12.375 5.22489 11.4583 4.30823 9.625 4.30823C11.4583 4.30823 12.375 3.39156 12.375 1.55823Z',
+				'M12.375 10.4418C12.375 11.7751 13.0417 12.4418 14.375 12.4418C13.0417 12.4418 12.375 13.1084 12.375 14.4418C12.375 13.1084 11.7083 12.4418 10.375 12.4418C11.7083 12.4418 12.375 11.7751 12.375 10.4418Z',
+			],
+			question: [
+				'M8 14.5C11.5899 14.5 14.5 11.5899 14.5 8C14.5 4.41015 11.5899 1.5 8 1.5C4.41015 1.5 1.5 4.41015 1.5 8C1.5 11.5899 4.41015 14.5 8 14.5Z',
+				'M5.75 6.69646C5.75 6.29865 5.88196 5.90976 6.12919 5.57899C6.37643 5.24821 6.72783 4.99041 7.13896 4.83817C7.5501 4.68593 8.0025 4.6461 8.43895 4.72371C8.87541 4.80132 9.27632 4.99289 9.59099 5.27419C9.90566 5.55549 10.12 5.91388 10.2068 6.30406C10.2936 6.69423 10.249 7.09866 10.0787 7.4662C9.90843 7.83373 9.62004 8.14787 9.25003 8.36889C9.19476 8.4019 9.13803 8.43262 9.08004 8.46099C8.52566 8.73217 8 9.20817 8 9.82532',
+				'M8 10.7416V11.7416',
+			],
+			answer: [
+				'M2.25 8.5L5.49732 11.7473C5.90519 12.1552 6.57263 12.1344 6.95426 11.7018L13.75 4',
+			],
+			reasoning: [
+				'M10.2854 5.71481C12.9673 8.39663 14.1182 11.5938 12.8562 12.8559C11.5942 14.1179 8.39706 12.9669 5.71518 10.2851C3.03333 7.60323 1.88236 4.40608 3.14441 3.14403C4.40644 1.882 7.6036 3.03297 10.2854 5.71481Z',
+				'M10.2854 10.2851C7.6036 12.9669 4.40644 14.1179 3.14441 12.8559C1.88236 11.5938 3.03333 8.39663 5.71518 5.71481C8.39706 3.03297 11.5942 1.882 12.8562 3.14403C14.1182 4.40608 12.9673 7.60323 10.2854 10.2851Z',
+				{
+					d: 'M8.86291 8.0002C8.86291 8.47549 8.47762 8.86087 8.00224 8.86087C7.52694 8.86087 7.1416 8.47549 7.1416 8.0002C7.1416 7.52485 7.52694 7.13953 8.00224 7.13953C8.47762 7.13953 8.86291 7.52485 8.86291 8.0002Z',
+					fill: true,
+				},
+			],
+			'tool-call': [
+				'M6.27612 1.5L4.52612 14.5',
+				'M11.4739 1.5L9.72388 14.5',
+				'M2.39868 5.5H14.0681',
+				'M1.93188 10.5H13.6013',
+			],
+			'tool-result': [
+				'M6.15479 4.91687H9.84543',
+				'M11.8798 9.55347V2.71525C11.8798 2.37416 11.564 2.09766 11.1744 2.09766H4.82577C4.43618 2.09766 4.12036 2.37416 4.12036 2.71525V9.55347',
+				'M2.28735 13.8022V8.84792C2.28735 8.77514 2.36262 8.72673 2.42884 8.75693L13.2936 13.7112C13.3914 13.7558 13.3596 13.9022 13.2521 13.9022H2.38735C2.33213 13.9022 2.28735 13.8575 2.28735 13.8022Z',
+				'M7.46929 10.979L13.5783 8.7416C13.6435 8.7177 13.7126 8.76601 13.7126 8.83551L13.7125 13.8022C13.7125 13.8574 13.6678 13.9022 13.6125 13.9022H7.99999',
+				'M6.15479 7.2395H9.05644',
+			],
+			todo: [
+				'M3.75 6.25C4.7165 6.25 5.5 5.4665 5.5 4.5C5.5 3.5335 4.7165 2.75 3.75 2.75C2.7835 2.75 2 3.5335 2 4.5C2 5.4665 2.7835 6.25 3.75 6.25Z',
+				'M7.5 4.5H13.5',
+				'M3.75 13.25C4.7165 13.25 5.5 12.4665 5.5 11.5C5.5 10.5335 4.7165 9.75 3.75 9.75C2.7835 9.75 2 10.5335 2 11.5C2 12.4665 2.7835 13.25 3.75 13.25Z',
+				'M7.5 11.5H13.5',
+			],
+			command: [
+				'M8 14.5C11.5899 14.5 14.5 11.5899 14.5 8C14.5 4.41015 11.5899 1.5 8 1.5C4.41015 1.5 1.5 4.41015 1.5 8C1.5 11.5899 4.41015 14.5 8 14.5Z',
+				'M10.3329 7.91346C10.3996 7.95195 10.3996 8.04818 10.3329 8.08667L6.78304 10.1362C6.71638 10.1747 6.63304 10.1266 6.63304 10.0496L6.63304 5.95055C6.63304 5.87357 6.71638 5.82546 6.78304 5.86395L10.3329 7.91346Z',
+			],
+			summary: [
+				'M8 14.5C11.5899 14.5 14.5 11.5899 14.5 8C14.5 4.41015 11.5899 1.5 8 1.5C4.41015 1.5 1.5 4.41015 1.5 8C1.5 11.5899 4.41015 14.5 8 14.5Z',
+				'M8 1.5C8.85359 1.5 9.69883 1.66813 10.4874 1.99478C11.2761 2.32144 11.9926 2.80022 12.5962 3.40381C13.1998 4.00739 13.6786 4.72394 14.0052 5.51256C14.3319 6.30117 14.5 7.14641 14.5 8',
+			],
+		}
+
+		/**
+		 * DeepSeek's own logo, for the assistant's rows.
+		 *
+		 * Taken from its favicon (`fe-static.deepseek.com/chat/favicon.svg`), so
+		 * the marker is the mark of the assistant being quoted rather than a
+		 * generic sparkle. It is a solid glyph on a `0 0 50 50` grid, so it keeps
+		 * its own viewBox instead of joining KIND_ARTWORK's 16px stroked set.
+		 */
+		const DEEPSEEK_LOGO = 'M48.8354 10.0479C48.3232 9.79199 48.1025 10.2798 47.8032 10.5278C47.7007 10.6079 47.6143 10.7119 47.5273 10.8076C46.7793 11.624 45.9048 12.1597 44.7622 12.0957C43.0923 12 41.666 12.5356 40.4058 13.8398C40.1377 12.2319 39.2476 11.272 37.8926 10.6558C37.1836 10.3359 36.4668 10.0156 35.9702 9.31982C35.6235 8.82373 35.5293 8.27197 35.356 7.72754C35.2456 7.3999 35.1353 7.06396 34.7651 7.00781C34.3633 6.94385 34.2056 7.2876 34.0479 7.57568C33.418 8.75195 33.1733 10.0479 33.1973 11.3599C33.2524 14.312 34.4736 16.6641 36.8999 18.3359C37.1758 18.5278 37.2466 18.7197 37.1597 19C36.9946 19.5757 36.7974 20.1357 36.624 20.7119C36.5137 21.0801 36.3486 21.1597 35.9624 21C34.6309 20.4321 33.481 19.5918 32.4644 18.5757C30.7393 16.8721 29.1792 14.9917 27.2334 13.52C26.7764 13.1758 26.3193 12.856 25.8467 12.5518C23.8618 10.584 26.1069 8.96777 26.627 8.77588C27.1704 8.57568 26.8159 7.8877 25.0591 7.896C23.3022 7.90381 21.6953 8.50391 19.647 9.30371C19.3477 9.42383 19.0322 9.51172 18.7095 9.58398C16.8501 9.22363 14.9199 9.14355 12.9033 9.37598C9.10596 9.80762 6.07275 11.6396 3.84326 14.7681C1.16455 18.5278 0.53418 22.7998 1.30664 27.2559C2.11768 31.9521 4.46582 35.8398 8.07373 38.8799C11.8159 42.0322 16.1255 43.5762 21.041 43.2803C24.0269 43.104 27.3516 42.6963 31.1016 39.4561C32.0469 39.936 33.0396 40.1279 34.686 40.272C35.9546 40.3921 37.1758 40.208 38.1211 40.0078C39.6021 39.688 39.4995 38.2881 38.9639 38.0322C34.623 35.9678 35.5762 36.8081 34.71 36.1279C36.9155 33.4639 40.2402 30.6958 41.54 21.728C41.6426 21.0161 41.5557 20.5679 41.54 19.9917C41.5322 19.6396 41.6108 19.5039 42.0049 19.4639C43.0923 19.3359 44.1479 19.0317 45.1167 18.4878C47.9292 16.9199 49.064 14.3438 49.3315 11.2559C49.3711 10.7837 49.3237 10.2959 48.8354 10.0479ZM24.3262 37.8398C20.1196 34.4639 18.0791 33.3521 17.2358 33.3999C16.4482 33.4482 16.5898 34.3682 16.7632 34.9678C16.9443 35.5601 17.1812 35.9683 17.5117 36.4878C17.7402 36.832 17.8979 37.3442 17.2832 37.728C15.9282 38.584 13.5728 37.4399 13.4624 37.3838C10.7207 35.7358 8.42822 33.5601 6.81348 30.584C5.25342 27.7197 4.34766 24.6479 4.19775 21.3677C4.1582 20.5757 4.38672 20.2959 5.15869 20.1519C6.17529 19.96 7.22314 19.9199 8.23926 20.0718C12.5327 20.7119 16.1885 22.6719 19.2529 25.7759C21.002 27.5439 22.3252 29.6558 23.6885 31.7202C25.1377 33.9121 26.6978 36 28.6831 37.7119C29.3843 38.312 29.9434 38.7681 30.479 39.104C28.8643 39.2881 26.1699 39.3281 24.3262 37.8398ZM26.3433 24.6001C26.3433 24.248 26.6191 23.9678 26.9658 23.9678C27.0444 23.9678 27.1152 23.9839 27.1782 24.0078C27.2651 24.04 27.3438 24.0879 27.4067 24.1602C27.5171 24.272 27.5801 24.4321 27.5801 24.6001C27.5801 24.9521 27.3042 25.2319 26.9575 25.2319C26.6108 25.2319 26.3433 24.9521 26.3433 24.6001ZM32.6064 27.8799C32.2046 28.0479 31.8027 28.1919 31.4165 28.208C30.8179 28.2397 30.1641 27.9922 29.8096 27.688C29.2583 27.2158 28.8643 26.9521 28.6987 26.1279C28.6279 25.7759 28.6675 25.2319 28.7305 24.9199C28.8721 24.248 28.7144 23.8159 28.2495 23.4238C27.8716 23.104 27.3911 23.0161 26.8633 23.0161C26.666 23.0161 26.4849 22.9277 26.3511 22.856C26.1304 22.7441 25.9492 22.4639 26.1226 22.1201C26.1777 22.0078 26.4458 21.7358 26.5088 21.688C27.2256 21.272 28.0527 21.4077 28.8169 21.7197C29.5259 22.0161 30.0615 22.5601 30.834 23.3281C31.6216 24.2559 31.7632 24.5117 32.2124 25.208C32.5669 25.752 32.8901 26.312 33.1104 26.9521C33.2446 27.3521 33.0713 27.6802 32.6064 27.8799Z'
+
+		/**
+		 * One row kind's icon, at the row marker's size.
+		 * @param kind - a row kind such as `user` or `tool-call`.
+		 * @returns an inline SVG element.
+		 */
+		function KindIcon(kind) {
+			// The assistant is DeepSeek's own mark rather than one of the shell's
+			// outline glyphs: a row that says "assistant" is quoting DeepSeek, and
+			// a generic sparkle there read as just another tool.
+			if (kind === 'assistant') {
+				return h('svg', {
+					className: 'dswc-kindIcon',
+					width: 13,
+					height: 13,
+					viewBox: '0 0 50 50',
+					fill: 'none',
+					xmlns: 'http://www.w3.org/2000/svg',
+					'aria-hidden': 'true',
+				}, h('path', { d: DEEPSEEK_LOGO, fill: 'currentColor', fillRule: 'nonzero' }))
+			}
+			const art = KIND_ARTWORK[kind] ?? KIND_ARTWORK.assistant
+			return h('svg', {
+				className: 'dswc-kindIcon',
+				width: 13,
+				height: 13,
+				viewBox: '0 0 16 16',
+				fill: 'none',
+				xmlns: 'http://www.w3.org/2000/svg',
+				'aria-hidden': 'true',
+				strokeWidth: 1,
+			}, art.map((entry, index) => {
+				const path = typeof entry === 'string' ? { d: entry } : entry
+				return h('path', {
+					key: index,
+					d: path.d,
+					stroke: path.fill === true ? 'none' : 'currentColor',
+					fill: path.fill === true ? 'currentColor' : 'none',
+				})
+			}))
+		}
+
+		/** How the guest finds the composer, most specific selector first. */
+		const COMPOSER_PICK = 'document.querySelector("textarea.ds-textarea__textarea")'
+			+ ' || document.querySelector("textarea[placeholder]")'
+			+ ' || document.querySelector("textarea")'
+
+		/**
+		 * The script that fills the DeepSeek composer.
+		 *
+		 * The composer is a React-controlled `<textarea class="ds-textarea__textarea">`
+		 * (the class is built as `"ds" + "-textarea__textarea"` in DeepSeek's own
+		 * bundle). Writing `.value` directly is ignored by React, so the native
+		 * value setter is used and an `input` event is dispatched, which is what
+		 * makes React commit the change.
+		 * @param text - the text to place in the composer.
+		 * @returns a self-contained script expression.
+		 */
+		function fillScript(text) {
+			return '(function () {'
+				+ ' try {'
+				+ ' var text = ' + JSON.stringify(text) + ';'
+				+ ' var el = ' + COMPOSER_PICK + ';'
+				+ ' if (!el) return { ok: false, error: "no-composer" };'
+				+ ' el.focus();'
+				+ ' var proto = Object.getPrototypeOf(el);'
+				+ ' var desc = Object.getOwnPropertyDescriptor(proto, "value")'
+				+ ' || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");'
+				+ ' if (desc && desc.set) desc.set.call(el, text); else el.value = text;'
+				+ ' el.dispatchEvent(new Event("input", { bubbles: true }));'
+				+ ' el.dispatchEvent(new Event("change", { bubbles: true }));'
+				+ ' el.selectionStart = el.value.length;'
+				+ ' el.selectionEnd = el.value.length;'
+				+ ' return { ok: true, length: el.value.length };'
+				+ ' } catch (error) {'
+				+ ' return { ok: false, error: String(error && error.message || error) };'
+				+ ' }'
+				+ ' })()'
+		}
+
+		/**
+		 * The script that submits the composer through DeepSeek's own handler.
+		 *
+		 * Its composer runs `onKeyDown` and, for a plain Enter, calls the very
+		 * function its send button calls. Dispatching a bubbling Enter therefore
+		 * runs the user's own code path — no invented shortcut, and no need to
+		 * guess at the send button's generated class name.
+		 * @returns a self-contained script expression.
+		 */
+		function sendScript() {
+			return '(function () {'
+				+ ' try {'
+				+ ' var el = ' + COMPOSER_PICK + ';'
+				+ ' if (!el) return { ok: false, error: "no-composer" };'
+				+ ' el.focus();'
+				+ ' el.dispatchEvent(new KeyboardEvent("keydown", {'
+				+ ' key: "Enter", code: "Enter", keyCode: 13, which: 13,'
+				+ ' bubbles: true, cancelable: true, composed: true'
+				+ ' }));'
+				+ ' return { ok: true };'
+				+ ' } catch (error) {'
+				+ ' return { ok: false, error: String(error && error.message || error) };'
+				+ ' }'
+				+ ' })()'
+		}
+
+		/**
+		 * The script that reports what the composer currently holds.
+		 *
+		 * DeepSeek clears its textarea once a send has been accepted, so an empty
+		 * composer is the receipt that the message actually went out — a much
+		 * better signal than assuming the click worked.
+		 * @returns a self-contained script expression.
+		 */
+		function probeScript() {
+			return '(function () {'
+				+ ' try {'
+				+ ' var el = ' + COMPOSER_PICK + ';'
+				+ ' if (!el) return { ok: false, error: "no-composer" };'
+				+ ' var value = String(el.value == null ? "" : el.value);'
+				+ ' return { ok: true, empty: value.trim() === "", length: value.length };'
+				+ ' } catch (error) {'
+				+ ' return { ok: false, error: String(error && error.message || error) };'
+				+ ' }'
+				+ ' })()'
+		}
+
+		/**
+		 * The script that clicks DeepSeek's own send button.
+		 *
+		 * The fallback for when the Enter path is refused. The button's class name
+		 * is a build-time hash, so it is found by its accessible name instead —
+		 * and it is never clicked when the composer was already cleared, which is
+		 * what stops a double send.
+		 * @returns a self-contained script expression.
+		 */
+		function clickSendScript() {
+			return '(function () {'
+				+ ' try {'
+				+ ' var wanted = /send|submit|发送/i;'
+				+ ' var nodes = document.querySelectorAll("button, [role=button]");'
+				+ ' for (var i = 0; i < nodes.length; i += 1) {'
+				+ ' var node = nodes[i];'
+				+ ' if (node.disabled === true) continue;'
+				+ ' var name = String(node.getAttribute("aria-label") || "") + " "'
+				+ ' + String(node.getAttribute("title") || "") + " "'
+				+ ' + String(node.getAttribute("data-testid") || "") + " "'
+				+ ' + String(node.textContent || "");'
+				+ ' if (!wanted.test(name)) continue;'
+				+ ' var rect = node.getBoundingClientRect();'
+				+ ' if (rect.width <= 0 || rect.height <= 0) continue;'
+				+ ' node.click();'
+				+ ' return { ok: true, found: true };'
+				+ ' }'
+				+ ' return { ok: true, found: false };'
+				+ ' } catch (error) {'
+				+ ' return { ok: false, error: String(error && error.message || error) };'
+				+ ' }'
+				+ ' })()'
+		}
+
+		/**
+		 * Run one script in the guest's page and normalise the answer.
+		 * @param script - a self-contained script expression.
+		 * @returns the script's own result object.
+		 */
+		async function runInGuest(script) {
+			if (guest === null) return { ok: false, error: 'no-guest' }
+			try {
+				const result = await guest.element.executeJavaScript(script)
+				if (result === null || typeof result !== 'object') return { ok: false, error: 'no-result' }
+				return result
+			} catch (error) {
+				return { ok: false, error: error instanceof Error ? error.message : String(error) }
+			}
+		}
+
+		/**
+		 * Fill the guest's composer.
+		 * @param text - the text to place there.
+		 * @returns a result describing what happened.
+		 */
+		async function fillComposer(text) {
+			return runInGuest(fillScript(text))
+		}
+
+		/**
+		 * Wait, then ask the composer whether the send landed.
+		 * @param delayMs - how long to give DeepSeek to accept the message.
+		 * @returns true once the composer has been cleared.
+		 */
+		async function composerCleared(delayMs) {
+			await new Promise((resolve) => setTimeout(resolve, delayMs))
+			const probe = await runInGuest(probeScript())
+			return probe.ok === true && probe.empty === true
+		}
+
+		/**
+		 * Put text into DeepSeek's composer and, when asked, submit it.
+		 * @param text - the text to place in the composer.
+		 * @param options - `{ send }` to submit it as well.
+		 * @returns `{ ok, length, sent, via?, error? }`.
+		 */
+		async function pushToDeepSeek(text, options = {}) {
+			const filled = await fillComposer(text)
+			if (filled.ok !== true) return filled
+			if (options.send !== true) return { ...filled, sent: false }
+			// React commits the new value asynchronously, so pressing Enter in the
+			// same tick would submit whatever was there before.
+			await new Promise((resolve) => setTimeout(resolve, 120))
+			const pressed = await runInGuest(sendScript())
+			if (pressed.ok !== true) return { ...filled, sent: false, error: pressed.error }
+			if (await composerCleared(800)) return { ...filled, sent: true, via: 'enter' }
+			// The Enter path was refused (its handler is a no-op when the composer
+			// reads as unsubmittable). Try DeepSeek's own button before giving up.
+			const clicked = await runInGuest(clickSendScript())
+			if (clicked.found === true && await composerCleared(800)) {
+				return { ...filled, sent: true, via: 'button' }
+			}
+			return { ...filled, sent: false, error: 'not-sent' }
+		}
+
+		//#endregion
+
+		//#region ui
+
+		/**
+		 * The chat-bubble glyph this plugin uses for both of its doors.
+		 *
+		 * Drawn to the shell's own icon spec rather than to taste, because the
+		 * icon sits in a row of built-in glyphs and any deviation reads as a
+		 * mistake: a `0 0 16 16` viewBox, a 1px stroke (the icon set's
+		 * `Regular` weight; `Medium` is 1.3), `fill: none` on the frame, and
+		 * `currentColor` throughout so the ink comes from whatever the host
+		 * paints — `--dsw-alias-label-secondary` in the guide's 26px icon box,
+		 * `--dsw-alias-label-tertiary` in the tab title.
+		 *
+		 * @param props - `{ size, className }`; the shell supplies both.
+		 * @returns the glyph.
+		 */
+		function ChatBubbleGlyph(props) {
+			const size = props?.size ?? 16
+			return h('svg', {
+				width: size, height: size, viewBox: '0 0 16 16',
+				className: props?.className,
+				fill: 'none', xmlns: 'http://www.w3.org/2000/svg',
+				strokeWidth: 1,
+				'aria-hidden': 'true',
+			}, [
+				// Frame: a rounded bubble with a tail on the lower left.
+				h('path', {
+					key: 'frame',
+					d: 'M4.5 2.5H11.5C12.6 2.5 13.5 3.4 13.5 4.5V9C13.5 10.1 12.6 11 11.5 11H7.25L4.5 13.25V11H4.5C3.4 11 2.5 10.1 2.5 9V4.5C2.5 3.4 3.4 2.5 4.5 2.5Z',
+					stroke: 'currentColor', strokeLinejoin: 'round',
+				}),
+				// One message line, so the glyph reads as a conversation.
+				h('path', { key: 'line', d: 'M5.5 6.75H10.5', stroke: 'currentColor', strokeLinecap: 'round' }),
+			])
+		}
+
+		/**
+		 * The guide door's artwork. The shell sizes a guide icon itself, so the
+		 * glyph reads the `size`/`className` it is handed.
+		 * @param props - `{ size, className }` from the guide entry.
+		 */
+		function GuideArtwork(props) {
+			return ChatBubbleGlyph(props)
+		}
+
+		/** The left-rail entry id: the global-panel key and the `main` view it selects. */
+		const SIDEBAR_ENTRY_ID = 'deepseek-webchat'
+
+		/**
+		 * The left-rail entry's glyph. The sidebar's panel rows hand this slot
+		 * `{ size, active }`; the bubble reads the size and inherits the row's ink
+		 * through `currentColor`.
+		 *
+		 * @param props - `{ size }` from the panel row.
+		 * @returns the glyph.
+		 */
+		function WebChatEntryGlyph(props) {
+			return ChatBubbleGlyph({ size: props?.size })
+		}
+
+		/**
+		 * The tab body: a toolbar, and either the picker or the measured guest area.
+		 * @param props - standard slot props plus the injected session id.
+		 */
+		function DeepSeekBody(props) {
+			const useTabInfo = props.useTabInfo
+			const tabInfo = typeof useTabInfo === 'function' ? useTabInfo() : undefined
+			const sessionId = props.sessionId ?? tabInfo?.tab?.sessionId
+			// The framework's own answer to "is this tab the one on screen". Guarded
+			// with `!== false` so a shell that does not publish the flag keeps the
+			// old always-park behaviour rather than hiding the guest forever.
+			const tabVisible = tabInfo?.tab?.visible !== false
+			const t = props.t ?? fallbackTranslate()
+			// The site the panel is showing; changing it re-runs the effect below.
+			const siteId = guestState().site
+
+			const hostRef = React.useRef(null)
+			const [version, setVersion] = React.useState(0)
+			const [pickerOpen, setPickerOpen] = React.useState(false)
+			const [bound, setBound] = React.useState(null)
+			const [messages, setMessages] = React.useState(null)
+			// How many of the oldest rows the host left out of the response because
+			// it would have been too large to send. Zero for every ordinary session.
+			const [dropped, setDropped] = React.useState(0)
+			const [loadError, setLoadError] = React.useState('')
+			const [selected, setSelected] = React.useState(() => new Set())
+			const [question, setQuestion] = React.useState('')
+			const [advanced, setAdvanced] = React.useState(false)
+			const [preamble, setPreamble] = React.useState(true)
+			const [lastN, setLastN] = React.useState(10)
+			const [busy, setBusy] = React.useState(false)
+			const [toast, setToast] = React.useState('')
+			// Bumped only by the explicit 「重新读取」 button. It is separate from
+			// `version` (guest state) so that a guest notification cannot re-run the
+			// message fetch, which would blank the list to its loading state.
+			const [reload, setReload] = React.useState(0)
+			// How many of the newest rows are mounted. Grows a page at a time from
+			// the top of the list, so a long session never builds every row at once.
+			const [pageSize, setPageSize] = React.useState(LIST_PAGE_SIZE)
+			const listRef = React.useRef(null)
+			// The row to hold in place while a page of earlier rows is inserted above.
+			const anchoredRef = React.useRef(null)
+
+			// React to the guest coming up, failing, or binding.
+			React.useEffect(() => {
+				const watcher = () => setVersion((value) => value + 1)
+				watchers.add(watcher)
+				return () => {
+					watchers.delete(watcher)
+				}
+			}, [])
+
+			// Count mounts and renders. A flicker of the panel area is either the
+			// guest being hidden and shown in a loop, or the shell tearing this body
+			// down and building it again; only these counters distinguish the two.
+			diag.renders += 1
+			React.useEffect(() => {
+				diag.mounts += 1
+				diagEvent('mount', { sessionId: String(sessionId ?? '') })
+				return () => {
+					diag.unmounts += 1
+					diagEvent('unmount', { sessionId: String(sessionId ?? '') })
+				}
+			}, [])
+
+			// Bring the guest up once the shell has a bridge for it.
+			React.useEffect(() => {
+				if (!hasBridge()) return
+				void ensureGuest()
+			}, [])
+
+			// Follow the DSH Session this pane belongs to.
+			//
+			// This deliberately does NOT depend on `version`: that is bumped by
+			// every notify() — and notify() fires from the guest's own navigation
+			// events, so depending on it made the effect navigate again and notify
+			// itself in a ping-pong that showed up as the panel flickering.
+			//
+			// It does depend on the site: switching sites decides whether the
+			// DeepSeek conversation (and its binding) should be restored.
+			React.useEffect(() => {
+				if (sessionId === undefined) return undefined
+				let cancelled = false
+				void (async () => {
+					await ensureGuest()
+					if (cancelled) return
+					if (guestState().site === 'deepseek') {
+						await focusSession(sessionId)
+						if (cancelled) return
+					}
+					setBound(await readBinding(sessionId))
+				})()
+				return () => {
+					cancelled = true
+				}
+			}, [sessionId, siteId])
+
+			// Park the guest on the measured area, and keep it parked.
+			//
+			// Visibility comes from the framework, never from measuring. The tab
+			// record carries `visible`, which the sidebar computes as "this tab is
+			// the one on screen" — exactly the question. The old code inferred it
+			// from the host element's own rectangle, and that was the flicker: the
+			// guest is parked in a `position:fixed` container covering that very
+			// element, so showing the guest could make it measure empty, which hid
+			// the guest, which made it measure fine again. A signal derived from
+			// the thing it controls oscillates; rounding and hysteresis only move
+			// the loop around.
+			//
+			// Geometry is now read solely to place the guest. A zero rectangle means
+			// "not laid out yet — wait", and is not a reason to hide.
+			//
+			// Depends on `pickerOpen` and `tabVisible` alone: re-running this effect
+			// is itself a hide/show cycle.
+			React.useEffect(() => {
+				if (!tabVisible) {
+					hideOverlay()
+					return undefined
+				}
+				const host = hostRef.current
+				if (host === null) return undefined
+				const update = () => {
+					diag.update += 1
+					if (overlaySuppressed || guest === null) {
+						diagEvent('update', { why: overlaySuppressed ? 'suppressed' : 'no-guest' })
+						hideOverlay()
+						return
+					}
+					// One layout read, not two. `getBoundingClientRect()` and
+					// `getClientRects()` both force the browser to flush pending
+					// layout, and an empty rect is already detectable from the
+					// bounding rect alone: a box that is not laid out measures 0x0.
+					// The old pair doubled the cost of every tick for the same answer.
+					const rect = host.getBoundingClientRect()
+					if (!(rect.width > 2) || !(rect.height > 2)) {
+						diag.misses += 1
+						diagEvent('update', {
+							why: 'not-laid-out', w: rect.width, h: rect.height,
+						})
+						return
+					}
+					diag.hits += 1
+					showOverlay(rect)
+				}
+				update()
+				const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(update) : null
+				if (observer !== null) observer.observe(host)
+				window.addEventListener('resize', update)
+				// The 250 ms poll is a fallback for the cases the observer cannot see:
+				// a pane whose position changed without its size changing (the
+				// sidebar widening, the header growing) moves the host rect but fires
+				// no resize. Two seconds is often enough for that, and each tick
+				// forces a layout read, so a fast timer here is real work for no
+				// benefit.
+				const timer = setInterval(update, PANE_POLL_MS)
+				// Diagnostics are opt-in. They were a debugging tool, and leaving them
+				// on in normal use cost a layout read plus a JSON POST every second —
+				// measured lag on a panel this small. `?diag=1` on the GUI URL turns
+				// them on; the plugin works identically either way.
+				let reporter = 0
+				if (diagnosticsEnabled()) {
+					const snapshot = () => {
+						let url = ''
+						try {
+							url = guest === null ? '' : guest.element.getURL()
+						} catch (error) {
+							url = ''
+						}
+						const rect = host.getBoundingClientRect()
+						return {
+							url,
+							suppressed: overlaySuppressed,
+							display: guest === null ? '' : guest.container.style.display,
+							host: {
+								l: Math.round(rect.left), t: Math.round(rect.top),
+								w: Math.round(rect.width), h: Math.round(rect.height),
+							},
+							rects: host.getClientRects().length,
+							pane: pickerOpen,
+						}
+					}
+					reporter = setInterval(() => postDiagnostics(snapshot()), 2000)
+					postDiagnostics(snapshot())
+				}
+				return () => {
+					if (observer !== null) observer.disconnect()
+					window.removeEventListener('resize', update)
+					clearInterval(timer)
+					if (reporter !== 0) clearInterval(reporter)
+					hideOverlay()
+				}
+			}, [pickerOpen, tabVisible])
+
+			// Hide the guest behind the picker.
+			React.useEffect(() => {
+				setOverlaySuppressed(pickerOpen)
+			}, [pickerOpen])
+
+			// Read the session's messages when the picker opens, when the advanced
+			// switch flips, when the Session changes, and when the user asks for a
+			// re-read. Deliberately *not* on `version`: that is bumped by notify(),
+			// and every pass blanks the list to its loading state first — so a guest
+			// notification (a binding landing, the guest coming up) wiped the list
+			// out from under whoever was reading it. `reload` is the explicit
+			// re-read, and it is the only thing that should blank the list.
+			React.useEffect(() => {
+				if (!pickerOpen || sessionId === undefined) return undefined
+				let cancelled = false
+				// Timed, because "getting the context freezes the whole app" is a
+				// report about one specific click and the numbers have to say which
+				// step it is. The fetch is measured separately from the state write,
+				// so a slow host query is distinguishable from a slow render.
+				const t0 = Date.now()
+				diagEvent('picker:open', { sessionId: String(sessionId) })
+				// A new fetch starts a new window: without this, paging a long session
+				// and then opening another one would begin already expanded.
+				setPageSize(LIST_PAGE_SIZE)
+				anchoredRef.current = null
+				setMessages(null)
+				setDropped(0)
+				setLoadError('')
+				void (async () => {
+					try {
+						const response = await fetch(
+							ROUTES.messages
+							+ '?sessionId=' + encodeURIComponent(sessionId)
+							+ (advanced ? '&advanced=1' : ''),
+						)
+						const payload = await response.json()
+						const fetched = Date.now() - t0
+						if (cancelled) return
+						if (payload?.ok !== true) {
+							diagEvent('picker:error', { ms: fetched, error: String(payload?.error ?? 'unknown') })
+							setLoadError(String(payload?.error ?? 'unknown'))
+							setMessages([])
+							return
+						}
+						const rows = Array.isArray(payload.messages) ? payload.messages : []
+						setMessages(rows)
+						// The host bounds the response (per-row and total size), so a
+						// very long session can arrive with its oldest rows already
+						// left out. There is no "load earlier" for those — the picker
+						// pages over what it received — so say how many are missing
+						// rather than let the count look wrong.
+						setDropped(Number.isFinite(payload.dropped) ? payload.dropped : 0)
+						diagEvent('picker:loaded', {
+							fetchMs: fetched,
+							rows: rows.length,
+							dropped: payload.dropped,
+							bytes: JSON.stringify(rows).length,
+							cached: payload.cached === true,
+						})
+					} catch (error) {
+						if (cancelled) return
+						diagEvent('picker:throw', { ms: Date.now() - t0, error: String(error) })
+						setLoadError(error instanceof Error ? error.message : String(error))
+						setMessages([])
+					}
+				})()
+				return () => {
+					cancelled = true
+				}
+			}, [pickerOpen, sessionId, reload, advanced])
+
+			const labels = React.useMemo(() => ({
+				user: t('picker.role.user'),
+				assistant: t('picker.role.assistant'),
+				tool: t('picker.role.tool'),
+				kind: {
+					question: t('picker.kind.question'),
+					answer: t('picker.kind.answer'),
+					reasoning: t('picker.kind.reasoning'),
+					'tool-call': t('picker.kind.toolCall'),
+					'tool-result': t('picker.kind.toolResult'),
+					todo: t('picker.kind.todo'),
+					command: t('picker.kind.command'),
+					summary: t('picker.kind.summary'),
+				},
+			}), [t])
+
+			const chosen = React.useMemo(() => {
+				if (messages === null) return []
+				return messages.filter((row) => selected.has(row.seq))
+			}, [messages, selected])
+
+			// The note travels with the quoted rows, so it is composed here rather
+			// than baked into the blockquote: a bare question needs no account of
+			// where it came from, and compose() knows whether anything is quoted.
+			const note = React.useMemo(
+				() => (preamble ? t('picker.preambleText') : ''),
+				[preamble, t],
+			)
+
+			const preview = React.useMemo(
+				() => compose(chosen, labels, question, { preamble: note }),
+				[chosen, labels, question, note],
+			)
+
+			// The list opens on the newest rows, which is what a person wants to
+			// quote and where they expect to be looking.
+			//
+			// It must not also do that when a page of *earlier* rows is inserted
+			// above: jumping to the bottom there would throw away the position the
+			// reader just scrolled to in order to click the button. So when an
+			// anchor was recorded, the previously-topmost row is held at the same
+			// offset and the anchor is consumed; otherwise the list goes to the end,
+			// which is right for a fresh fetch or the picker opening.
+			React.useEffect(() => {
+				const node = listRef.current
+				if (node === null) return
+				const anchorSeq = anchoredRef.current
+				if (anchorSeq !== null) {
+					anchoredRef.current = null
+					const anchor = node.querySelector(`[data-seq="${anchorSeq}"]`)
+					if (anchor !== null) {
+						node.scrollTop = anchor.offsetTop - node.offsetTop
+						return
+					}
+				}
+				node.scrollTop = node.scrollHeight
+			}, [messages, pickerOpen, pageSize])
+
+			const toggle = React.useCallback((seq) => {
+				setSelected((current) => {
+					const next = new Set(current)
+					if (next.has(seq)) next.delete(seq)
+					else next.add(seq)
+					return next
+				})
+			}, [])
+
+			const push = React.useCallback(async (send) => {
+				if (preview.trim() === '') return
+				setBusy(true)
+				setToast('')
+				try {
+					setPickerOpen(false)
+					// Let the guest become visible again before scripting it.
+					await new Promise((resolve) => setTimeout(resolve, 120))
+					const result = await pushToDeepSeek(preview, { send })
+					if (result.ok !== true) {
+						setToast(result.error === 'no-composer'
+							? t('toast.nocomposer')
+							: format(t('status.failed'), { error: String(result.error) }))
+						return
+					}
+					// The selection has been consumed either way — it is in
+					// DeepSeek's composer now — so leaving it ticked would only make
+					// the next push repeat this one.
+					setSelected(new Set())
+					setQuestion('')
+					if (send && result.sent === true) {
+						setToast(format(t('toast.sent'), { count: result.length ?? preview.length }))
+					} else if (send) {
+						setToast(t('toast.sendPending'))
+					} else {
+						setToast(format(t('toast.filled'), { count: result.length ?? preview.length }))
+					}
+				} finally {
+					setBusy(false)
+				}
+			}, [preview, t])
+
+			const copy = React.useCallback(async () => {
+				try {
+					await navigator.clipboard.writeText(preview)
+					setToast(t('toast.copied'))
+				} catch (error) {
+					setToast(String(error))
+				}
+			}, [preview, t])
+
+			const unbind = React.useCallback(async () => {
+				if (sessionId === undefined) return
+				await fetch(ROUTES.binding, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ dshSessionId: sessionId, forget: true }),
+				})
+				// Drop the write cache too, or a later visit to the same
+				// conversation would be silently skipped as "already bound".
+				forgetBoundPairs(sessionId)
+				setBound(null)
+				setToast(t('toast.rebound'))
+				navigate(PAGE_URL)
+			}, [sessionId, t])
+
+			const state = guestState()
+			const isDeepSeek = state.site === 'deepseek'
+			const siteLabel = siteById(state.site).label
+			const statusText = state.failure !== ''
+				? format(t('status.failed'), { error: state.failure })
+				: (isDeepSeek
+					? (bound !== null ? format(t('status.bound'), { id: bound }) : t('status.unbound'))
+					: format(t('status.site'), { site: siteLabel }))
+
+			// A glyph, not a sentence: the full status is the tooltip, because a
+			// failure message is far too long for a toolbar.
+			const statusGlyph = state.failure !== '' ? '⚠' : (isDeepSeek ? (bound !== null ? '●' : '○') : '◆')
+
+			const toolbar = h('div', { className: 'dswc-toolbar' }, [
+				h('select', {
+					key: 'site',
+					className: 'dswc-select',
+					value: state.site,
+					title: t('site.title'),
+					'aria-label': t('site.title'),
+					onChange: (event) => {
+						// A switch leaves the DeepSeek picker behind; close it so the
+						// new site is visible and the guest is not suppressed.
+						setPickerOpen(false)
+						void switchSite(event.target.value)
+					},
+				}, state.sites.map((site) => h('option', { key: site.id, value: site.id }, site.label))),
+				h('span', {
+					key: 'status',
+					className: 'dswc-status',
+					title: statusText,
+					role: 'img',
+					'aria-label': statusText,
+					'data-state': state.failure !== '' ? 'error' : (isDeepSeek ? (bound !== null ? 'bound' : 'unbound') : 'site'),
+				}, statusGlyph),
+				h('span', { key: 'gap', className: 'dswc-gap' }),
+				isDeepSeek ? h('button', {
+					key: 'send',
+					type: 'button',
+					className: 'dswc-button',
+					onClick: () => setPickerOpen((open) => !open),
+				}, pickerOpen ? t('action.back') : t('action.send')) : null,
+				h('button', {
+					key: 'reload',
+					type: 'button',
+					className: 'dswc-button',
+					onClick: () => {
+						if (guest !== null) {
+							try {
+								guest.element.reload()
+							} catch (error) {
+								// Nothing to reload.
+							}
+						}
+					},
+				}, t('action.reload')),
+				isDeepSeek ? h('button', {
+					key: 'unbind',
+					type: 'button',
+					className: 'dswc-button',
+					disabled: bound === null,
+					onClick: () => void unbind(),
+				}, t('action.rebind')) : null,
+			])
+
+			const toastRow = toast === ''
+				? null
+				: h('div', { className: 'dswc-toast' }, toast)
+
+			if (!state.hasBridge) {
+				return h('div', { className: 'dswc-root' }, [
+					toolbar,
+					h('div', { key: 'notice', className: 'dswc-notice' }, [
+						h('p', { key: 'a' }, t('status.nobridge')),
+						h('p', { key: 'b', className: 'dswc-muted' }, t('status.nobridgeHint')),
+					]),
+				])
+			}
+
+			if (!pickerOpen) {
+				return h('div', { className: 'dswc-root' }, [
+					toolbar,
+					h('div', { key: 'host', className: 'dswc-host', ref: hostRef }),
+					toastRow,
+				])
+			}
+
+			// Paged from the newest rows backwards. The list opens scrolled to the
+			// bottom, so the newest few are what a person reads and picks from;
+			// older rows are pulled in a page at a time from the top. Selection is
+			// by `seq`, not by mounted row, so 全选 and 选末尾 still act on the whole
+			// session however few rows are on screen.
+			const total = messages === null ? 0 : messages.length
+			const start = Math.max(0, total - pageSize)
+			const hiddenEarlier = start > 0
+			const shown = messages === null ? null : messages.slice(start)
+			const list = shown === null
+				? h('div', { className: 'dswc-notice' }, t('picker.loading'))
+				: shown.length === 0
+					? h('div', { className: 'dswc-notice' }, [
+						h('p', { key: 'a' }, advanced ? t('picker.emptyAdvanced') : t('picker.empty')),
+						loadError === '' ? null : h('p', { key: 'b', className: 'dswc-muted' }, loadError),
+					])
+					: h('div', { className: 'dswc-list', ref: listRef }, [
+						hiddenEarlier
+							? h('div', { key: 'more', className: 'dswc-more' }, [
+								h('button', {
+									key: 'load',
+									type: 'button',
+									className: 'dswc-button',
+									onClick: () => {
+										// Remember the topmost visible row, so the effect
+										// above can hold the reader's place while the
+										// earlier rows are inserted above it.
+										const node = listRef.current
+										const first = node === null
+											? null
+											: node.querySelector('.dswc-row')
+										anchoredRef.current = first === null
+											? null
+											: first.getAttribute('data-seq')
+										setPageSize((size) => size + LIST_PAGE_SIZE)
+									},
+								}, format(t('action.loadEarlier'), {
+									count: Math.min(LIST_PAGE_SIZE, start),
+								})),
+								h('span', { key: 'left', className: 'dswc-muted' },
+									format(t('picker.hiddenEarlier'), { count: start })),
+							])
+							: null,
+						// Rows the host left out of the response entirely (it caps the
+						// total size of a reply). They are older than everything here
+						// and cannot be paged to, so say so once rather than silently
+						// disagreeing with 全选 and 选末尾.
+						dropped === 0
+							? null
+							: h('div', { key: 'dropped', className: 'dswc-more' },
+								format(t('picker.droppedEarlier'), { count: dropped })),
+						...shown.map((row) => h('label', {
+							key: row.seq,
+							className: 'dswc-row',
+							'data-role': row.role,
+							'data-kind': row.kind ?? row.role,
+							'data-seq': String(row.seq),
+						}, [
+							h('input', {
+								key: 'box',
+								type: 'checkbox',
+								checked: selected.has(row.seq),
+								onChange: () => toggle(row.seq),
+							}),
+							h('span', {
+								key: 'role',
+								className: 'dswc-role',
+								title: kindLabel(row, labels),
+							}, [
+								KindIcon(row.kind ?? row.role),
+								h('span', { key: 'label', className: 'dswc-roleLabel' }, kindLabel(row, labels)),
+							]),
+							h('span', { key: 'text', className: 'dswc-text' }, row.text),
+						])),
+					])
+
+			return h('div', { className: 'dswc-root' }, [
+				toolbar,
+				h('div', { key: 'picker', className: 'dswc-picker' }, [
+					h('div', { key: 'head', className: 'dswc-pickerHead' }, [
+						h('span', { key: 'title', className: 'dswc-pickerTitle' }, t('picker.title')),
+						h('span', { key: 'count', className: 'dswc-muted' },
+							format(t('picker.selected'), { count: chosen.length })),
+						h('span', { key: 'gap', className: 'dswc-gap' }),
+						h('button', {
+							key: 'all',
+							type: 'button',
+							className: 'dswc-button',
+							onClick: () => setSelected(new Set((messages ?? []).map((row) => row.seq))),
+						}, t('action.all')),
+						h('button', {
+							key: 'none',
+							type: 'button',
+							className: 'dswc-button',
+							onClick: () => setSelected(new Set()),
+						}, t('action.none')),
+						// Quoting the tail of a conversation is the common case, so
+						// it gets its own control instead of asking for hand-ticking.
+						h('select', {
+							key: 'lastN',
+							className: 'dswc-select',
+							title: t('picker.lastCount'),
+							'aria-label': t('picker.lastCount'),
+							value: String(lastN),
+							onChange: (event) => setLastN(Number(event.target.value)),
+						}, [5, 10, 20, 50].map((n) => h('option', { key: n, value: String(n) }, String(n)))),
+						h('button', {
+							key: 'last',
+							type: 'button',
+							className: 'dswc-button',
+							disabled: (messages ?? []).length === 0,
+							onClick: () => {
+								const rows = messages ?? []
+								setSelected(new Set(
+									rows.slice(Math.max(0, rows.length - lastN)).map((row) => row.seq),
+								))
+							},
+						}, t('action.last')),
+						h('button', {
+							key: 'refresh',
+							type: 'button',
+							className: 'dswc-button',
+							onClick: () => setReload((value) => value + 1),
+						}, t('action.refresh')),
+						// The advanced switch swaps the whole row set rather than
+						// revealing hidden rows: the host filters, so a tool result the
+						// user never opted into is never sent to the browser at all.
+						h('label', {
+							key: 'advanced',
+							className: 'dswc-advanced',
+							title: t('picker.advancedHint'),
+						}, [
+							h('input', {
+								key: 'box',
+								type: 'checkbox',
+								checked: advanced,
+								onChange: (event) => {
+									setAdvanced(event.target.checked)
+									// Selections refer to rows that may no longer exist.
+									setSelected(new Set())
+								},
+							}),
+							h('span', { key: 'text' }, t('picker.advanced')),
+						]),
+						h('label', {
+							key: 'preamble',
+							className: 'dswc-advanced',
+							title: t('picker.preambleHint'),
+						}, [
+							h('input', {
+								key: 'box',
+								type: 'checkbox',
+								checked: preamble,
+								onChange: (event) => setPreamble(event.target.checked),
+							}),
+							h('span', { key: 'text' }, t('picker.preamble')),
+						]),
+					]),
+					list,
+					h('div', { key: 'compose', className: 'dswc-compose' }, [
+						h('label', { key: 'qlabel', className: 'dswc-label' }, t('picker.question')),
+						h('textarea', {
+							key: 'question',
+							className: 'dswc-question',
+							rows: 3,
+							value: question,
+							placeholder: t('picker.questionPlaceholder'),
+							onChange: (event) => setQuestion(event.target.value),
+						}),
+						h('label', { key: 'plabel', className: 'dswc-label' }, t('picker.preview')),
+						h('pre', { key: 'preview', className: 'dswc-preview' }, preview),
+						h('p', { key: 'hint', className: 'dswc-muted' }, t('picker.hint')),
+						h('div', { key: 'actions', className: 'dswc-actions' }, [
+							h('button', {
+								key: 'send',
+								type: 'button',
+								className: 'dswc-button dswc-primary',
+								disabled: busy || preview.trim() === '',
+								onClick: () => void push(true),
+							}, busy ? t('status.filling') : t('action.fill')),
+							h('button', {
+								key: 'fill',
+								type: 'button',
+								className: 'dswc-button',
+								disabled: busy || preview.trim() === '',
+								onClick: () => void push(false),
+							}, t('action.fillOnly')),
+							h('button', {
+								key: 'copy',
+								type: 'button',
+								className: 'dswc-button',
+								disabled: preview.trim() === '',
+								onClick: () => void copy(),
+							}, t('action.copy')),
+						]),
+					]),
+				]),
+				toastRow,
+			])
+		}
+
+		//#endregion
+
+		/**
+		 * A one-click door in the conversation header, so the tab does not have to
+		 * be reached through the column's guide.
+		 *
+		 * The chrome comes from `.dswc-headerButton`, which copies the built-in
+		 * icon buttons in that row: a 24px square, an 8px radius, muted ink and a
+		 * translucent hover. The glyph is the same 16px/1px bubble the guide uses.
+		 *
+		 * @param props - standard props plus the injected `open`.
+		 */
+		function HeaderButton(props) {
+			const t = props.t ?? fallbackTranslate()
+			const label = t('action.send')
+			return h('button', {
+				type: 'button',
+				className: 'dswc-headerButton',
+				title: label,
+				'aria-label': label,
+				onClick: () => props.open(),
+			}, ChatBubbleGlyph({}))
+		}
+
+		/** Register the tab type, its guide door, and its body. */
+		function apply(ctx) {
+			ensureStyle()
+			ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'deepseek-webchat: copy')
+			const t = ctx.locale.bind(NS)
+			// Ask whether this host half can store one snapshot per site.
+			void probeHostSites()
+			ctx.effect(() => ctx.sidebarRightTabs.register({
+				id: TAB_ID,
+				kind: TAB_KIND,
+				title: () => t('type.label'),
+				// A `<webview>` dies when it leaves the document, so the body must
+				// outlive a tab switch for the page (and a half-typed question) to
+				// survive one.
+				keepMounted: true,
+				guide: [{
+					id: 'open',
+					order: 40,
+					title: () => t('guide.title'),
+					description: () => t('guide.description'),
+					icon: GuideArtwork,
+				}],
+			}), 'deepseek-webchat: tab type')
+			ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+				name: 'sidebar.right.pane.tab',
+				key: TAB_ID,
+				locale: NS,
+				inject: (sessionId) => ({ sessionId }),
+			}, DeepSeekBody)), 'deepseek-webchat: body')
+			// The left rail's door: a global-panel row directly under New Session,
+			// labelled "Web Chat". A panel row can only select a main-panel view, so
+			// that view is a door too: it opens (or reveals) this plugin's tab for
+			// the Session on screen and hands the main column back to the
+			// Conversation in the same commit, so the click reads as "open the
+			// chat" rather than "leave the conversation".
+			function openDoor() {
+				try {
+					ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true })
+					return true
+				} catch (error) {
+					// Nothing is on screen yet (the hero): start a Session, then retry
+					// until its surface is mounted.
+					const uiWorkspace = typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined
+					if (uiWorkspace === undefined) return false
+					try { uiWorkspace.startSession() } catch (startError) { return false }
+					let attempts = 0
+					const retry = () => {
+						attempts += 1
+						try {
+							ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true })
+						} catch (retryError) {
+							if (attempts < 12) setTimeout(retry, 120)
+						}
+					}
+					setTimeout(retry, 120)
+					return false
+				}
+			}
+			const returnToConversation = () => {
+				const layout = typeof ctx.get === 'function' ? ctx.get('layout') : undefined
+				try { layout?.selectPanel(null) } catch (error) {}
+			}
+			function WebChatDoor() {
+				React.useLayoutEffect(() => {
+					openDoor()
+					returnToConversation()
+				}, [])
+				return null
+			}
+			ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+				name: 'sidebar.panellist',
+				id: SIDEBAR_ENTRY_ID,
+				order: -1,
+				label: () => 'Web Chat',
+			}, WebChatEntryGlyph)), 'deepseek-webchat: sidebar entry')
+			ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
+				name: 'main',
+				key: SIDEBAR_ENTRY_ID,
+			}, WebChatDoor)), 'deepseek-webchat: sidebar door view')
+			ctx.effect(() => () => {
+				disposeGuest()
+			}, 'deepseek-webchat: guest lifetime')
+		}
+
+		const inject = ['slots', 'locale', 'sidebarRight', 'sidebarRightTabs']
+
+		exports.apply = apply
+		exports.inject = inject
+		return module.exports
+	},
+})
