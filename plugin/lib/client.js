@@ -157,6 +157,14 @@ window.__ModuleLoader__.load({
 			'guide.description': '在侧边栏打开网页版聊天（DeepSeek / ChatGPT / Gemini / Claude）',
 			'site.title': '网页站点',
 			'status.site': '当前站点：{site}（仅 DeepSeek 支持上下文接力）',
+			'settings.title': 'Web Chat',
+			'settings.defaultSite': '默认网页',
+			'settings.defaultSiteHint': '打开 Web Chat 时默认显示的网页；切换后当前面板也会跟着切换。',
+			'settings.autoOpen': '启动 DSH 时自动打开 Web Chat',
+			'settings.autoOpenHint': '应用启动后展开右侧 Web Chat 面板；需要当前已有会话。',
+			'settings.autoOpenShort': '开启',
+			'settings.open': '打开 Web Chat',
+			'settings.deepseekNote': '上下文引用与自动填入仅对 DeepSeek 生效。',
 			'action.send': '引用上下文',
 			'action.back': '返回网页',
 			'action.reload': '刷新',
@@ -222,6 +230,14 @@ window.__ModuleLoader__.load({
 			'guide.description': 'Open a web chat in the sidebar (DeepSeek / ChatGPT / Gemini / Claude)',
 			'site.title': 'Web chat site',
 			'status.site': 'Site: {site} (context handoff works on DeepSeek only)',
+			'settings.title': 'Web Chat',
+			'settings.defaultSite': 'Default site',
+			'settings.defaultSiteHint': 'The page Web Chat opens with. Changing it also switches the open panel.',
+			'settings.autoOpen': 'Open Web Chat when DSH starts',
+			'settings.autoOpenHint': 'Reveal the right-hand Web Chat pane after launch. Needs an open session.',
+			'settings.autoOpenShort': 'On',
+			'settings.open': 'Open Web Chat',
+			'settings.deepseekNote': 'Quote context and auto-fill work on DeepSeek only.',
 			'action.send': 'Quote context',
 			'action.back': 'Back to page',
 			'action.reload': 'Reload',
@@ -377,6 +393,27 @@ window.__ModuleLoader__.load({
 				globalThis.localStorage?.setItem(SITE_KEY, siteById(id).id)
 			} catch (error) {
 				// A blocked storage only costs the preference, not the panel.
+			}
+		}
+
+		/** Storage key for "open the Web Chat tab when the app starts". */
+		const AUTO_OPEN_KEY = 'dsh-deepseek-webchat:auto-open'
+
+		/** @returns whether the Web Chat tab should open by itself at launch. */
+		function readPersistedAutoOpen() {
+			try {
+				return globalThis.localStorage?.getItem(AUTO_OPEN_KEY) === '1'
+			} catch (error) {
+				return false
+			}
+		}
+
+		/** @param value - the new auto-open preference. */
+		function persistAutoOpen(value) {
+			try {
+				globalThis.localStorage?.setItem(AUTO_OPEN_KEY, value ? '1' : '0')
+			} catch (error) {
+				// A blocked storage only costs the preference.
 			}
 		}
 
@@ -833,6 +870,22 @@ window.__ModuleLoader__.load({
 				'.dswc-floatingToast{position:fixed;left:50%;bottom:30px;transform:translateX(-50%);z-index:2147483000;max-width:460px;padding:9px 14px;border-radius:12px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1,#1f2023) 90%,transparent);border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 50%,transparent);color:var(--dsw-alias-label-primary,#fff);font-size:12.5px;line-height:1.5;text-align:center;box-shadow:0 12px 34px rgba(0,0,0,.3);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);animation:dswc-toast-in .18s ease-out}',
 				'@keyframes dswc-menu-in{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:scale(1)}}',
 				'@keyframes dswc-toast-in{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}',
+				// Settings → Web Chat.
+				'.dswc-settings{display:flex;flex-direction:column;gap:14px;max-width:720px}',
+				'.dswc-settingsCard{display:flex;flex-direction:column;border-radius:16px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 55%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2,#fff) 46%,transparent);overflow:hidden}',
+				'.dswc-settingsRow{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:14px 16px;border-top:1px solid color-mix(in srgb,var(--dsw-alias-border-l3,rgba(120,130,150,.28)) 60%,transparent)}',
+				'.dswc-settingsRow:first-child{border-top:0}',
+				'.dswc-settingsCopy{display:flex;flex-direction:column;gap:3px;min-width:0;padding-right:12px}',
+				'.dswc-settingsLabel{font-size:13px;font-weight:600;line-height:1.4}',
+				'.dswc-settingsHint{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary,#5b6472)}',
+				'.dswc-settingsSelect{flex:none;height:32px;min-width:150px;padding:0 28px 0 12px;border-radius:9px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 60%,transparent);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#111827);font:inherit;font-size:13px;cursor:pointer;outline:none}',
+				'.dswc-settingsSelect:focus{border-color:var(--dsw-alias-state-business-primary,#4d6bfe);box-shadow:0 0 0 3px rgba(77,107,254,.18)}',
+				'.dswc-settingsToggle{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dsw-alias-label-secondary,#5b6472);cursor:pointer;flex:none}',
+				'.dswc-settingsToggle input{width:15px;height:15px;accent-color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
+				'.dswc-settingsActions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}',
+				'.dswc-settingsAction{height:32px;padding:0 14px;border-radius:9px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 60%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2,#fff) 50%,transparent);color:inherit;font:inherit;font-size:13px;cursor:pointer;transition:background .16s ease,border-color .16s ease}',
+				'.dswc-settingsAction:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}',
+				'.dswc-settingsNote{font-size:12px;color:var(--dsw-alias-label-tertiary,#6b7280)}',
 			].join('\n')
 			document.head.appendChild(tag)
 		}
@@ -2761,6 +2814,102 @@ window.__ModuleLoader__.load({
 				name: 'main',
 				key: SIDEBAR_ENTRY_ID,
 			}, WebChatDoor)), 'deepseek-webchat: sidebar door view')
+
+			/**
+			 * Settings → Web Chat: default site, launch auto-open, and the door.
+			 *
+			 * The site preference is the same localStorage key the toolbar dropdown
+			 * writes, so the two controls can never disagree; changing it here also
+			 * switches an already-open panel.
+			 */
+			function WebChatSettings() {
+				const [version, setVersion] = React.useState(0)
+				const [autoOpen, setAutoOpen] = React.useState(() => readPersistedAutoOpen())
+				React.useEffect(() => {
+					const watcher = () => setVersion((value) => value + 1)
+					watchers.add(watcher)
+					return () => {
+						watchers.delete(watcher)
+					}
+				}, [])
+				const state = guestState()
+				const chooseSite = (id) => {
+					persistSite(id)
+					activeSiteId = id
+					notify()
+					if (guest !== null) void switchSite(id)
+				}
+				return h('div', { className: 'dswc-settings' }, [
+					h('div', { key: 'card', className: 'dswc-settingsCard' }, [
+						h('div', { key: 'site', className: 'dswc-settingsRow' }, [
+							h('div', { key: 'copy', className: 'dswc-settingsCopy' }, [
+								h('div', { key: 'label', className: 'dswc-settingsLabel' }, t('settings.defaultSite')),
+								h('div', { key: 'hint', className: 'dswc-settingsHint' }, t('settings.defaultSiteHint')),
+							]),
+							h('select', {
+								key: 'select',
+								className: 'dswc-settingsSelect',
+								value: state.site,
+								'aria-label': t('settings.defaultSite'),
+								onChange: (event) => chooseSite(event.target.value),
+							}, SITES.map((site) => h('option', { key: site.id, value: site.id }, site.label))),
+						]),
+						h('div', { key: 'auto', className: 'dswc-settingsRow' }, [
+							h('div', { key: 'copy', className: 'dswc-settingsCopy' }, [
+								h('div', { key: 'label', className: 'dswc-settingsLabel' }, t('settings.autoOpen')),
+								h('div', { key: 'hint', className: 'dswc-settingsHint' }, t('settings.autoOpenHint')),
+							]),
+							h('label', { key: 'toggle', className: 'dswc-settingsToggle' }, [
+								h('input', {
+									key: 'input',
+									type: 'checkbox',
+									checked: autoOpen,
+									onChange: (event) => {
+										const next = event.target.checked
+										setAutoOpen(next)
+										persistAutoOpen(next)
+									},
+								}),
+								h('span', { key: 'text' }, t('settings.autoOpenShort')),
+							]),
+						]),
+					]),
+					h('div', { key: 'actions', className: 'dswc-settingsActions' }, [
+						h('button', {
+							key: 'open',
+							type: 'button',
+							className: 'dswc-settingsAction',
+							onClick: () => openDoor(),
+						}, t('settings.open')),
+						h('span', { key: 'note', className: 'dswc-settingsNote' }, t('settings.deepseekNote')),
+					]),
+				])
+			}
+
+			ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+				name: 'settings.section',
+				id: 'dsh-deepseek-webchat',
+				order: 55,
+				label: () => t('settings.title'),
+			}, WebChatSettings)), 'deepseek-webchat: settings section')
+
+			// Launch preference: reveal the tab once surfaces exist. Failures are
+			// silent (the hero has no session pane to open a tab into).
+			if (readPersistedAutoOpen()) {
+				const reveal = () => {
+					try {
+						ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true })
+					} catch (error) {
+						// No session surface yet; the next attempt has another chance.
+					}
+				}
+				const first = setTimeout(reveal, 1200)
+				const second = setTimeout(reveal, 4000)
+				ctx.effect(() => () => {
+					clearTimeout(first)
+					clearTimeout(second)
+				}, 'deepseek-webchat: launch auto-open')
+			}
 
 			/**
 			 * Put a right-clicked selection into the Web Chat composer.

@@ -39,7 +39,7 @@
  		/**
  		 * The storage account asked of the shell. A constant on purpose: the shell
  		 * caches one partition per workspace key for the whole app run, so one
-@@ -131,9 +152,11 @@
+@@ -131,9 +152,19 @@
  
  		/** Locale-owned copy. */
  		const zh = {
@@ -51,10 +51,18 @@
 +			'guide.description': '在侧边栏打开网页版聊天（DeepSeek / ChatGPT / Gemini / Claude）',
 +			'site.title': '网页站点',
 +			'status.site': '当前站点：{site}（仅 DeepSeek 支持上下文接力）',
++			'settings.title': 'Web Chat',
++			'settings.defaultSite': '默认网页',
++			'settings.defaultSiteHint': '打开 Web Chat 时默认显示的网页；切换后当前面板也会跟着切换。',
++			'settings.autoOpen': '启动 DSH 时自动打开 Web Chat',
++			'settings.autoOpenHint': '应用启动后展开右侧 Web Chat 面板；需要当前已有会话。',
++			'settings.autoOpenShort': '开启',
++			'settings.open': '打开 Web Chat',
++			'settings.deepseekNote': '上下文引用与自动填入仅对 DeepSeek 生效。',
  			'action.send': '引用上下文',
  			'action.back': '返回网页',
  			'action.reload': '刷新',
-@@ -186,12 +209,19 @@
+@@ -186,12 +217,27 @@
  			'toast.nocomposer': '没找到 DeepSeek 输入框，请先在网页里打开一个对话。',
  			'toast.copied': '已复制到剪贴板。',
  			'toast.rebound': '已解除绑定，下次打开将新建对话。',
@@ -74,10 +82,18 @@
 +			'guide.description': 'Open a web chat in the sidebar (DeepSeek / ChatGPT / Gemini / Claude)',
 +			'site.title': 'Web chat site',
 +			'status.site': 'Site: {site} (context handoff works on DeepSeek only)',
++			'settings.title': 'Web Chat',
++			'settings.defaultSite': 'Default site',
++			'settings.defaultSiteHint': 'The page Web Chat opens with. Changing it also switches the open panel.',
++			'settings.autoOpen': 'Open Web Chat when DSH starts',
++			'settings.autoOpenHint': 'Reveal the right-hand Web Chat pane after launch. Needs an open session.',
++			'settings.autoOpenShort': 'On',
++			'settings.open': 'Open Web Chat',
++			'settings.deepseekNote': 'Quote context and auto-fill work on DeepSeek only.',
  			'action.send': 'Quote context',
  			'action.back': 'Back to page',
  			'action.reload': 'Reload',
-@@ -244,6 +274,11 @@
+@@ -244,6 +290,11 @@
  			'toast.nocomposer': 'No DeepSeek composer found. Open a conversation in the page first.',
  			'toast.copied': 'Copied to the clipboard.',
  			'toast.rebound': 'Binding cleared; the next visit starts a new conversation.',
@@ -89,7 +105,7 @@
  		}
  
  		//#region urls
-@@ -295,9 +330,56 @@
+@@ -295,9 +346,77 @@
  				return decodeURIComponent(match[1])
  			} catch (error) {
  				return match[1]
@@ -143,10 +159,31 @@
 +			}
 +		}
 +
++		/** Storage key for "open the Web Chat tab when the app starts". */
++		const AUTO_OPEN_KEY = 'dsh-deepseek-webchat:auto-open'
++
++		/** @returns whether the Web Chat tab should open by itself at launch. */
++		function readPersistedAutoOpen() {
++			try {
++				return globalThis.localStorage?.getItem(AUTO_OPEN_KEY) === '1'
++			} catch (error) {
++				return false
++			}
++		}
++
++		/** @param value - the new auto-open preference. */
++		function persistAutoOpen(value) {
++			try {
++				globalThis.localStorage?.setItem(AUTO_OPEN_KEY, value ? '1' : '0')
++			} catch (error) {
++				// A blocked storage only costs the preference.
++			}
++		}
++
  		//#endregion
  
  		//#region copy
-@@ -347,8 +429,14 @@
+@@ -347,8 +466,14 @@
  		let activeSessionId = undefined
  		/** The last URL observed, so a binding is only taken from a settled URL. */
  		let lastSeenUrl = ''
@@ -162,7 +199,7 @@
  		/** True while the picker is open; the guest hides behind it. */
  		let overlaySuppressed = false
  		/** Subscribers told when the binding state changes. */
-@@ -362,9 +450,103 @@
+@@ -362,7 +487,101 @@
  				ready: guest !== null,
  				failure,
  				hasBridge: hasBridge(),
@@ -228,7 +265,7 @@
 +				} catch (error) {
 +					// A snapshot that fails costs a login, not the panel.
 +				}
- 			}
++			}
 +			activeSiteId = site.id
 +			lastGuestSiteId = site.id
 +			lastRequestedUrl = site.url
@@ -240,8 +277,8 @@
 +				return
 +			}
 +			navigate(site.url)
- 		}
- 
++		}
++
 +		/**
 +		 * Follow the guest's own navigation (redirects included) so the toolbar
 +		 * shows the site it actually landed on.
@@ -253,7 +290,7 @@
 +				url = element.getURL()
 +			} catch (error) {
 +				return
-+			}
+ 			}
 +			const site = siteOfUrl(url)
 +			if (site === undefined || site.id === lastGuestSiteId) return
 +			lastGuestSiteId = site.id
@@ -261,12 +298,10 @@
 +			activeSiteId = site.id
 +			persistSite(site.id)
 +			notify()
-+		}
-+
+ 		}
+ 
  		/** Notify every subscriber that the guest state changed. */
- 		function notify() {
- 			diag.notify += 1
-@@ -584,6 +766,9 @@
+@@ -584,6 +803,9 @@
  				'.dswc-status{font-size:11px;line-height:1;color:var(--dsw-alias-label-tertiary,#adb2b8)}',
  				'.dswc-status[data-state="bound"]{color:#2ea043}',
  				'.dswc-status[data-state="error"]{color:#d1242f}',
@@ -276,7 +311,7 @@
  				'.dswc-gap{flex:1 1 auto}',
  				'.dswc-button{font:inherit;font-size:11px;padding:3px 8px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l4,rgba(128,128,128,.35));background:transparent;color:inherit;cursor:pointer;white-space:nowrap}',
  				'.dswc-button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12))}',
-@@ -638,6 +823,16 @@
+@@ -638,6 +860,32 @@
  				'.dswc-headerButton{box-sizing:border-box;display:inline-flex;flex:none;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary,#cfd3d6);cursor:pointer}',
  				'.dswc-headerButton:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08));color:var(--dsw-alias-label-primary,#fff)}',
  				'.dswc-headerButton:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}',
@@ -290,10 +325,26 @@
 +				'.dswc-floatingToast{position:fixed;left:50%;bottom:30px;transform:translateX(-50%);z-index:2147483000;max-width:460px;padding:9px 14px;border-radius:12px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1,#1f2023) 90%,transparent);border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 50%,transparent);color:var(--dsw-alias-label-primary,#fff);font-size:12.5px;line-height:1.5;text-align:center;box-shadow:0 12px 34px rgba(0,0,0,.3);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);animation:dswc-toast-in .18s ease-out}',
 +				'@keyframes dswc-menu-in{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:scale(1)}}',
 +				'@keyframes dswc-toast-in{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}',
++				// Settings → Web Chat.
++				'.dswc-settings{display:flex;flex-direction:column;gap:14px;max-width:720px}',
++				'.dswc-settingsCard{display:flex;flex-direction:column;border-radius:16px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 55%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2,#fff) 46%,transparent);overflow:hidden}',
++				'.dswc-settingsRow{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:14px 16px;border-top:1px solid color-mix(in srgb,var(--dsw-alias-border-l3,rgba(120,130,150,.28)) 60%,transparent)}',
++				'.dswc-settingsRow:first-child{border-top:0}',
++				'.dswc-settingsCopy{display:flex;flex-direction:column;gap:3px;min-width:0;padding-right:12px}',
++				'.dswc-settingsLabel{font-size:13px;font-weight:600;line-height:1.4}',
++				'.dswc-settingsHint{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary,#5b6472)}',
++				'.dswc-settingsSelect{flex:none;height:32px;min-width:150px;padding:0 28px 0 12px;border-radius:9px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 60%,transparent);background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#111827);font:inherit;font-size:13px;cursor:pointer;outline:none}',
++				'.dswc-settingsSelect:focus{border-color:var(--dsw-alias-state-business-primary,#4d6bfe);box-shadow:0 0 0 3px rgba(77,107,254,.18)}',
++				'.dswc-settingsToggle{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dsw-alias-label-secondary,#5b6472);cursor:pointer;flex:none}',
++				'.dswc-settingsToggle input{width:15px;height:15px;accent-color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
++				'.dswc-settingsActions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}',
++				'.dswc-settingsAction{height:32px;padding:0 14px;border-radius:9px;border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 60%,transparent);background:color-mix(in srgb,var(--dsw-alias-bg-layer-2,#fff) 50%,transparent);color:inherit;font:inherit;font-size:13px;cursor:pointer;transition:background .16s ease,border-color .16s ease}',
++				'.dswc-settingsAction:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}',
++				'.dswc-settingsNote{font-size:12px;color:var(--dsw-alias-label-tertiary,#6b7280)}',
  			].join('\n')
  			document.head.appendChild(tag)
  		}
-@@ -779,10 +974,21 @@
+@@ -779,10 +1027,21 @@
  			if (value) hideOverlay()
  		}
  
@@ -318,7 +369,7 @@
  				const payload = await response.json()
  				if (payload === null || typeof payload !== 'object') return null
  				const storage = Array.isArray(payload.storage) ? payload.storage : []
-@@ -861,8 +1067,17 @@
+@@ -861,8 +1120,17 @@
  		 */
  		async function saveGuestSession(withState) {
  			if (guest === null) return
@@ -338,7 +389,7 @@
  			let state = null
  			if (withState) {
  				try {
-@@ -877,6 +1092,7 @@
+@@ -877,6 +1145,7 @@
  					method: 'POST',
  					headers: { 'content-type': 'application/json' },
  					body: JSON.stringify({
@@ -346,7 +397,7 @@
  						storage: Array.isArray(state?.storage) ? state.storage : [],
  						cookie: typeof state?.cookie === 'string' ? state.cookie : '',
  					}),
-@@ -1047,6 +1263,8 @@
+@@ -1047,6 +1316,8 @@
  		async function focusSession(rawSessionId) {
  			const dshSessionId = canonicalSessionId(rawSessionId)
  			if (dshSessionId === '') return
@@ -355,7 +406,7 @@
  			activeSessionId = dshSessionId
  			if (guest === null) return
  			let current
-@@ -1143,7 +1361,7 @@
+@@ -1143,7 +1414,7 @@
  						|| typeof reservation.partition !== 'string') {
  						throw new Error('the desktop browser bridge returned no reservation')
  					}
@@ -364,7 +415,7 @@
  					const element = document.createElement('webview')
  					element.setAttribute('name', reservation.lease)
  					element.setAttribute('partition', reservation.partition)
-@@ -1155,7 +1373,8 @@
+@@ -1155,7 +1426,8 @@
  						partition: reservation.partition,
  						element,
  						container: overlayContainer(),
@@ -374,7 +425,7 @@
  						timer: 0,
  						poller: 0,
  					}
-@@ -1172,33 +1391,40 @@
+@@ -1172,33 +1444,40 @@
  						navigate(lastRequestedUrl)
  					}, { once: true })
  					// Storage and cookies can only be written while the page is on
@@ -386,7 +437,16 @@
 -					// the one attempt. Until this settles, snapshots are skipped:
 -					// the freshly loaded page still has empty storage, and saving
 -					// that would erase the very snapshot being restored.
--					element.addEventListener('did-finish-load', () => {
++					// its own origin, so they are restored after a real site loads
++					// and the page is then asked to load once more — this time
++					// already signed in. The origin check matters: the guest's first
++					// document is `about:blank#<lease>`, where writing storage throws,
++					// and treating that as the restore would burn the one attempt.
++					//
++					// A snapshot is restored once per site and app run: the guest
++					// partition is per-run, so every site starts logged out on each
++					// launch and needs its own storage replayed before it settles.
+ 					element.addEventListener('did-finish-load', () => {
 -						if (record.storageState !== 'pending') return
 -						if (!onDeepSeekOrigin(element)) return
 -						record.storageState = 'restoring'
@@ -399,16 +459,7 @@
 -								record.storageState = 'done'
 -							})
 -					})
-+					// its own origin, so they are restored after a real site loads
-+					// and the page is then asked to load once more — this time
-+					// already signed in. The origin check matters: the guest's first
-+					// document is `about:blank#<lease>`, where writing storage throws,
-+					// and treating that as the restore would burn the one attempt.
-+					//
-+					// A snapshot is restored once per site and app run: the guest
-+					// partition is per-run, so every site starts logged out on each
-+					// launch and needs its own storage replayed before it settles.
- 					element.addEventListener('did-finish-load', () => {
+-					element.addEventListener('did-finish-load', () => {
 -						if (record.storageState === 'pending' || record.storageState === 'restoring') return
 -						void saveGuestSession(true)
 +						const site = siteOfUrl(element.getURL())
@@ -438,13 +489,12 @@
  							// A navigation means the URL is worth re-reading, but it
  							// must not clear the settle marker: the poll below settles
  							// by seeing the same URL twice, and wiping it on every
-@@ -1612,7 +1838,91 @@
- 		}
+@@ -1613,6 +1892,90 @@
  
  		//#endregion
-+
-+		//#region selection bridge
  
++		//#region selection bridge
++
 +		/** How much selected text one handoff carries. */
 +		const SELECTION_LIMIT = 6000
 +		/** Marks the floating selection menu so clicks inside it are recognised. */
@@ -530,7 +580,7 @@
  		//#region ui
  
  		/**
-@@ -1656,6 +1966,21 @@
+@@ -1656,6 +2019,21 @@
  		 */
  		function GuideArtwork(props) {
  			return ChatBubbleGlyph(props)
@@ -552,7 +602,7 @@
  		}
  
  		/**
-@@ -1671,6 +1996,8 @@
+@@ -1671,6 +2049,8 @@
  			// old always-park behaviour rather than hiding the guest forever.
  			const tabVisible = tabInfo?.tab?.visible !== false
  			const t = props.t ?? fallbackTranslate()
@@ -561,7 +611,7 @@
  
  			const hostRef = React.useRef(null)
  			const [version, setVersion] = React.useState(0)
-@@ -1729,25 +2056,29 @@
+@@ -1729,25 +2109,29 @@
  
  			// Follow the DSH Session this pane belongs to.
  			//
@@ -599,7 +649,7 @@
  
  			// Park the guest on the measured area, and keep it parked.
  			//
-@@ -2040,30 +2371,47 @@
+@@ -2040,30 +2424,47 @@
  			}, [sessionId, t])
  
  			const state = guestState()
@@ -652,7 +702,7 @@
  				h('button', {
  					key: 'reload',
  					type: 'button',
-@@ -2078,13 +2426,13 @@
+@@ -2078,13 +2479,13 @@
  						}
  					},
  				}, t('action.reload')),
@@ -668,7 +718,7 @@
  			])
  
  			const toastRow = toast === ''
-@@ -2339,6 +2687,8 @@
+@@ -2339,6 +2740,8 @@
  			ensureStyle()
  			ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'deepseek-webchat: copy')
  			const t = ctx.locale.bind(NS)
@@ -677,7 +727,7 @@
  			ctx.effect(() => ctx.sidebarRightTabs.register({
  				id: TAB_ID,
  				kind: TAB_KIND,
-@@ -2361,15 +2711,164 @@
+@@ -2361,15 +2764,271 @@
  				locale: NS,
  				inject: (sessionId) => ({ sessionId }),
  			}, DeepSeekBody)), 'deepseek-webchat: body')
@@ -742,6 +792,102 @@
 +			}, WebChatDoor)), 'deepseek-webchat: sidebar door view')
 +
 +			/**
++			 * Settings → Web Chat: default site, launch auto-open, and the door.
++			 *
++			 * The site preference is the same localStorage key the toolbar dropdown
++			 * writes, so the two controls can never disagree; changing it here also
++			 * switches an already-open panel.
++			 */
++			function WebChatSettings() {
++				const [version, setVersion] = React.useState(0)
++				const [autoOpen, setAutoOpen] = React.useState(() => readPersistedAutoOpen())
++				React.useEffect(() => {
++					const watcher = () => setVersion((value) => value + 1)
++					watchers.add(watcher)
++					return () => {
++						watchers.delete(watcher)
++					}
++				}, [])
++				const state = guestState()
++				const chooseSite = (id) => {
++					persistSite(id)
++					activeSiteId = id
++					notify()
++					if (guest !== null) void switchSite(id)
++				}
++				return h('div', { className: 'dswc-settings' }, [
++					h('div', { key: 'card', className: 'dswc-settingsCard' }, [
++						h('div', { key: 'site', className: 'dswc-settingsRow' }, [
++							h('div', { key: 'copy', className: 'dswc-settingsCopy' }, [
++								h('div', { key: 'label', className: 'dswc-settingsLabel' }, t('settings.defaultSite')),
++								h('div', { key: 'hint', className: 'dswc-settingsHint' }, t('settings.defaultSiteHint')),
++							]),
++							h('select', {
++								key: 'select',
++								className: 'dswc-settingsSelect',
++								value: state.site,
++								'aria-label': t('settings.defaultSite'),
++								onChange: (event) => chooseSite(event.target.value),
++							}, SITES.map((site) => h('option', { key: site.id, value: site.id }, site.label))),
++						]),
++						h('div', { key: 'auto', className: 'dswc-settingsRow' }, [
++							h('div', { key: 'copy', className: 'dswc-settingsCopy' }, [
++								h('div', { key: 'label', className: 'dswc-settingsLabel' }, t('settings.autoOpen')),
++								h('div', { key: 'hint', className: 'dswc-settingsHint' }, t('settings.autoOpenHint')),
++							]),
++							h('label', { key: 'toggle', className: 'dswc-settingsToggle' }, [
++								h('input', {
++									key: 'input',
++									type: 'checkbox',
++									checked: autoOpen,
++									onChange: (event) => {
++										const next = event.target.checked
++										setAutoOpen(next)
++										persistAutoOpen(next)
++									},
++								}),
++								h('span', { key: 'text' }, t('settings.autoOpenShort')),
++							]),
++						]),
++					]),
++					h('div', { key: 'actions', className: 'dswc-settingsActions' }, [
++						h('button', {
++							key: 'open',
++							type: 'button',
++							className: 'dswc-settingsAction',
++							onClick: () => openDoor(),
++						}, t('settings.open')),
++						h('span', { key: 'note', className: 'dswc-settingsNote' }, t('settings.deepseekNote')),
++					]),
++				])
++			}
++
++			ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
++				name: 'settings.section',
++				id: 'dsh-deepseek-webchat',
++				order: 55,
++				label: () => t('settings.title'),
++			}, WebChatSettings)), 'deepseek-webchat: settings section')
++
++			// Launch preference: reveal the tab once surfaces exist. Failures are
++			// silent (the hero has no session pane to open a tab into).
++			if (readPersistedAutoOpen()) {
++				const reveal = () => {
++					try {
++						ctx.sidebarRight.openTab(TAB_KIND, { revealIfOpened: true })
++					} catch (error) {
++						// No session surface yet; the next attempt has another chance.
++					}
++				}
++				const first = setTimeout(reveal, 1200)
++				const second = setTimeout(reveal, 4000)
++				ctx.effect(() => () => {
++					clearTimeout(first)
++					clearTimeout(second)
++				}, 'deepseek-webchat: launch auto-open')
++			}
++
++			/**
 +			 * Put a right-clicked selection into the Web Chat composer.
 +			 *
 +			 * Opens the Web Chat tab first, then waits for the guest and its composer:
@@ -764,7 +910,18 @@
 +				const deadline = Date.now() + 14000
 +				while (Date.now() < deadline) {
 +					if (!opened) opened = openDoor()
++					// Only fill once the guest actually sits on DeepSeek: while a site
++					// switch is still navigating, the old page is still the DOM that
++					// executeJavaScript sees, and filling its search box would be wrong.
++					let onDeepSeek = false
 +					if (guest !== null) {
++						try {
++							onDeepSeek = siteOfUrl(guest.element.getURL())?.id === 'deepseek'
++						} catch (error) {
++							onDeepSeek = false
++						}
++					}
++					if (onDeepSeek) {
 +						const filled = await fillComposer(quoted)
 +						if (filled !== null && filled !== undefined && filled.ok === true) {
 +							showFloatingToast(format(t('toast.selectionFilled'), { count: filled.length ?? quoted.length }))

@@ -208,6 +208,40 @@ if (select !== null) {
   check(after?.props?.value === 'chatgpt', 'switching to chatgpt did not update the selection')
 }
 
+// ---------------------------------------------------------------- settings section
+const settingsEntry = registrations.find((entry) => entry.options.name === 'settings.section')
+check(settingsEntry !== undefined, 'no Settings → Web Chat section was registered')
+check(settingsEntry?.options?.id === 'dsh-deepseek-webchat', 'settings section id mismatch')
+check(settingsEntry?.options?.order === 55, 'settings section order should be 55')
+check(settingsEntry?.options?.label?.() === 'settings.title', 'settings section label is not localised')
+const settingsTree = settingsEntry.component({})
+const findSettingsSelect = (node) => {
+  if (node === null || node === undefined) return null
+  if (Array.isArray(node)) {
+    for (const child of node) { const hit = findSettingsSelect(child); if (hit) return hit }
+    return null
+  }
+  if (typeof node !== 'object') return null
+  if (node.type === 'select' && node.props?.className === 'dswc-settingsSelect') return node
+  for (const child of node.children ?? []) { const hit = findSettingsSelect(child); if (hit) return hit }
+  return null
+}
+const settingsSelect = findSettingsSelect(settingsTree)
+check(settingsSelect !== null, 'settings section has no default-site select')
+if (settingsSelect !== null) {
+  const options = flatten(settingsSelect.children).map((option) => ({
+    value: option.props?.value,
+    label: option.children?.[0],
+  }))
+  check(JSON.stringify(options.map((option) => option.value))
+    === JSON.stringify(['deepseek', 'chatgpt', 'gemini', 'claude']), 'settings site options mismatch')
+  check(['deepseek', 'chatgpt', 'gemini', 'claude'].includes(settingsSelect.props?.value),
+    'settings default site is not a known site: ' + String(settingsSelect.props?.value))
+  settingsSelect.props.onChange({ target: { value: 'gemini' } })
+  const after = findSettingsSelect(settingsEntry.component({}))
+  check(after?.props?.value === 'gemini', 'settings default-site change did not take effect')
+}
+
 // ---------------------------------------------------------------- right-click handoff
 check((documentListeners.get('contextmenu')?.length ?? 0) > 0, 'no document contextmenu listener was installed')
 check((documentListeners.get('mousedown')?.length ?? 0) > 0, 'no document mousedown listener was installed')
@@ -243,5 +277,5 @@ if (failures.length > 0) {
   for (const failure of failures) console.error('  - ' + failure)
   process.exit(1)
 }
-console.log('client-smoke: PASS (apply + 4-site dropdown + site switch + right-click handoff)')
+console.log('client-smoke: PASS (apply + 4-site dropdown + site switch + right-click handoff + settings)')
 process.exit(0)

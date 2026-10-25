@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-webchat",
-  "version": "0.6.0-multisite",
+  "version": "0.6.1-multisite",
   "description": "Web Chat panel for DeepSeek Harness Desktop: pick DeepSeek, ChatGPT, Gemini or Claude in one native sidebar tab. Fork of dsh-deepseek-webchat 0.4.10 (MIT) by Ckarefulon, extended with a left-sidebar entry and a web-chat site selector.",
   "keywords": [
     "dsh",

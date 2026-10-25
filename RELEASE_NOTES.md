@@ -1,5 +1,15 @@
 基于上游 [Ckarefulon/dsh-deepseek-webchat](https://github.com/Ckarefulon/dsh-deepseek-webchat) v0.4.10（MIT）的二次开发版本。
 
+## 0.6.1-multisite · 新增设置页
+
+- **设置 → Web Chat**：默认网页（DeepSeek / ChatGPT / Gemini / Claude）四选一，改完立即
+  切换当前面板并记住选择；
+- **启动 DSH 时自动打开 Web Chat** 开关（默认关闭）；
+- **打开 Web Chat** 按钮，从设置页直接跳到面板；
+- 提示：自动填入与右键接力仅对 DeepSeek 生效。
+
+`Web-Chat-for-DSH-0.6.1-multisite.dmg`
+
 ## 0.6.0-multisite · 新增右键接力
 
 - **选中对话文字 → 右键 → 「在 Web Chat 中继续」**：自动打开 Web Chat，把选中内容按

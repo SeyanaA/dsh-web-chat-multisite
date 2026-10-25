@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1-multisite
+
+### Added
+- **设置页新增 Web Chat 分节**（设置 → Web Chat），把网页面板的偏好集中到 DSH 设置里：
+  - **默认网页**：DeepSeek / ChatGPT / Gemini / Claude 四选一；与面板工具栏下拉共用同一个
+    偏好键，改完立即生效，切换后当前面板也会跟着切换，重启后沿用上次选择；
+  - **启动 DSH 时自动打开 Web Chat**：可选开关（默认关闭），启动后自动展开右侧 Web Chat
+    面板（需要当前已有会话，没有会话时静默跳过）；
+  - **打开 Web Chat** 按钮：直接从设置页跳转到面板；
+  - 提示自动填入/上下文接力仅对 DeepSeek 生效。
+
 ## 0.6.0-multisite
 
 ### Added
