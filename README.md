@@ -121,6 +121,7 @@ node test/host-snapshot.mjs  # 宿主端会话快照 v1→v2 迁移与按站点�
 
 ## 许可与致谢
 
+- 协作开发：[Codex](https://github.com/codex)（OpenAI 编程助手）。
 - 上游：[dsh-deepseek-webchat](https://github.com/Ckarefulon/dsh-deepseek-webchat)
   © 2026 Ckarefulon，MIT License；
 - 本修改版 © 2026 SeyanaA，同样以 MIT License 发布，完整声明见 [`LICENSE`](./LICENSE)
