@@ -2785,7 +2785,18 @@ window.__ModuleLoader__.load({
 				const deadline = Date.now() + 14000
 				while (Date.now() < deadline) {
 					if (!opened) opened = openDoor()
+					// Only fill once the guest actually sits on DeepSeek: while a site
+					// switch is still navigating, the old page is still the DOM that
+					// executeJavaScript sees, and filling its search box would be wrong.
+					let onDeepSeek = false
 					if (guest !== null) {
+						try {
+							onDeepSeek = siteOfUrl(guest.element.getURL())?.id === 'deepseek'
+						} catch (error) {
+							onDeepSeek = false
+						}
+					}
+					if (onDeepSeek) {
 						const filled = await fillComposer(quoted)
 						if (filled !== null && filled !== undefined && filled.ok === true) {
 							showFloatingToast(format(t('toast.selectionFilled'), { count: filled.length ?? quoted.length }))
