@@ -1,6 +1,15 @@
 基于上游 [Ckarefulon/dsh-deepseek-webchat](https://github.com/Ckarefulon/dsh-deepseek-webchat) v0.4.10（MIT）的二次开发版本。
 
-## 本版改动
+## 0.6.0-multisite · 新增右键接力
+
+- **选中对话文字 → 右键 → 「在 Web Chat 中继续」**：自动打开 Web Chat，把选中内容按
+  `>` 引用格式填入网页版输入框（不自动发送，按 Enter 由你决定）；
+- 当前站点不是 DeepSeek 时会自动切回 DeepSeek；输入框未就绪会自动等待重试；
+- 成功/失败底部轻提示；右键菜单为 macOS 风格玻璃浮动菜单，输入框内保留系统菜单。
+
+`Web-Chat-for-DSH-0.6.0-multisite.dmg`
+
+## 0.5.0-multisite 改动
 
 - **左侧栏入口**：`Web Chat` 全局面板行（「新会话」正下方），替代原来的会话头部图标。
 - **站点下拉**：面板工具栏可切换 **DeepSeek / ChatGPT / Gemini / Claude** 四个官方网页版，选择会记住。

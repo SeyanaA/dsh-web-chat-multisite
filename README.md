@@ -19,6 +19,8 @@ DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepS
 - **真实网页版**：`chat.deepseek.com`、`chatgpt.com`、`gemini.google.com`、`claude.ai`
   都是官方页面本身，经由桌面端原生 browser guest 加载（内嵌浏览器分区、沙箱、拒绝权限请求，
   与 DSH 内置 Browser 侧栏同一机制）。
+- **右键接力**：在 DSH 对话里选中文字 → 右键 → **在 Web Chat 中继续**。
+  自动打开 Web Chat 并把选中内容按 `>` 引用格式填入网页版输入框（不自动发送）。
 - **DeepSeek 专属能力保留**：
   - 每个 DSH 会话 ↔ 一个 DeepSeek 对话自动绑定（切换会话时右侧面板跟着切）；
   - 「引用上下文」：勾选 Harness 会话中的消息 / AI 提问 / 你的回答 / 待办，填入 DeepSeek
@@ -38,7 +40,7 @@ DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepS
 ## 安装（DMG，推荐）
 
 1. 从 [Releases](https://github.com/SeyanaA/dsh-web-chat-multisite/releases/latest) 下载
-   `Web-Chat-for-DSH-0.5.0-multisite.dmg` 并双击打开；
+   `Web-Chat-for-DSH-0.6.0-multisite.dmg` 并双击打开；
 2. **先完全退出 DeepSeek Harness（⌘Q）**（安装脚本会检查并提示）；
 3. 双击 DMG 里的 **安装 Web Chat.command**；
    - 如果 macOS 提示「无法验证开发者」：右键该文件 →「打开」→ 再点「打开」；

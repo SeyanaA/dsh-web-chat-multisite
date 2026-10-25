@@ -209,6 +209,11 @@ window.__ModuleLoader__.load({
 			'toast.nocomposer': '没找到 DeepSeek 输入框，请先在网页里打开一个对话。',
 			'toast.copied': '已复制到剪贴板。',
 			'toast.rebound': '已解除绑定，下次打开将新建对话。',
+			'ctxmenu.webchat': '在 Web Chat 中继续',
+			'ctxmenu.selection': '已选 {count} 字 · 将填入 Web Chat 输入框',
+			'ctxmenu.preamble': '以下是我在 DSH 对话中选中的内容，作为上下文参考：',
+			'toast.selectionFilled': '已填入 Web Chat 输入框（{count} 字），请按 Enter 发送。',
+			'toast.selectionNoComposer': '没有找到 Web Chat 输入框：请先打开 Web Chat 面板并进入一个网页对话。',
 		}
 
 		const en = {
@@ -269,6 +274,11 @@ window.__ModuleLoader__.load({
 			'toast.nocomposer': 'No DeepSeek composer found. Open a conversation in the page first.',
 			'toast.copied': 'Copied to the clipboard.',
 			'toast.rebound': 'Binding cleared; the next visit starts a new conversation.',
+			'ctxmenu.webchat': 'Continue in Web Chat',
+			'ctxmenu.selection': '{count} chars selected · will fill the Web Chat composer',
+			'ctxmenu.preamble': 'Below is an excerpt I selected from a DSH conversation, for context:',
+			'toast.selectionFilled': 'Filled the Web Chat composer ({count} chars) — press Enter there to send.',
+			'toast.selectionNoComposer': 'No Web Chat composer found. Open the Web Chat panel and a web conversation first.',
 		}
 
 		//#region urls
@@ -813,6 +823,16 @@ window.__ModuleLoader__.load({
 				'.dswc-headerButton{box-sizing:border-box;display:inline-flex;flex:none;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary,#cfd3d6);cursor:pointer}',
 				'.dswc-headerButton:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08));color:var(--dsw-alias-label-primary,#fff)}',
 				'.dswc-headerButton:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4d6bfe);outline-offset:1px}',
+				// The right-click handoff: a macOS-style floating menu plus its one line
+				// of feedback. Both live outside the panel so a long selection can be
+				// sent without opening the quote picker first.
+				'.dswc-ctxmenu{position:fixed;z-index:2147483000;min-width:236px;max-width:340px;padding:5px;border-radius:11px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1,#fff) 84%,transparent);border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 55%,rgba(255,255,255,.6));box-shadow:0 14px 40px rgba(16,24,40,.22),0 2px 8px rgba(16,24,40,.08);backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);font-size:13px;color:var(--dsw-alias-label-primary,#111827);overflow:hidden;animation:dswc-menu-in .14s ease-out}',
+				'.dswc-ctxmenuItem{display:flex;align-items:center;gap:8px;width:100%;padding:7px 10px;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
+				'.dswc-ctxmenuItem:hover{background:rgba(10,132,255,.14);color:#0a6ed1}',
+				'.dswc-ctxmenuHint{padding:1px 10px 6px;font-size:11px;line-height:1.4;color:var(--dsw-alias-label-tertiary,#6b7280);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+				'.dswc-floatingToast{position:fixed;left:50%;bottom:30px;transform:translateX(-50%);z-index:2147483000;max-width:460px;padding:9px 14px;border-radius:12px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1,#1f2023) 90%,transparent);border:1px solid color-mix(in srgb,var(--dsw-alias-border-l2,rgba(120,130,150,.4)) 50%,transparent);color:var(--dsw-alias-label-primary,#fff);font-size:12.5px;line-height:1.5;text-align:center;box-shadow:0 12px 34px rgba(0,0,0,.3);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);animation:dswc-toast-in .18s ease-out}',
+				'@keyframes dswc-menu-in{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:scale(1)}}',
+				'@keyframes dswc-toast-in{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}',
 			].join('\n')
 			document.head.appendChild(tag)
 		}
@@ -1819,6 +1839,90 @@ window.__ModuleLoader__.load({
 
 		//#endregion
 
+		//#region selection bridge
+
+		/** How much selected text one handoff carries. */
+		const SELECTION_LIMIT = 6000
+		/** Marks the floating selection menu so clicks inside it are recognised. */
+		const CONTEXT_MENU_ATTR = 'data-dswc-context-menu'
+		/** The open floating selection menu, if any. */
+		let contextMenuElement = null
+		/** The single floating feedback toast, if any. */
+		let floatingToastElement = null
+		/** Timer that clears the feedback toast. */
+		let floatingToastTimer = null
+
+		/**
+		 * Quote a selected block for the composer, so every line stays quoted.
+		 * @param text - the selected text.
+		 * @param note - the localised sentence explaining where it came from.
+		 * @returns the text to fill into the web page's composer.
+		 */
+		function quoteSelection(text, note) {
+			const lines = String(text).replace(/\r\n?/g, '\n').split('\n')
+			return note + '\n\n' + lines.map((line) => '> ' + line).join('\n')
+		}
+
+		/**
+		 * @returns the current selection's text, or '' when there is none or it
+		 * belongs to an editable control (where the browser's own menu belongs).
+		 */
+		function readSelectedText() {
+			const selection = typeof window.getSelection === 'function' ? window.getSelection() : null
+			if (selection === null || selection === undefined) return ''
+			let text = ''
+			try {
+				text = String(selection.toString() ?? '')
+			} catch (error) {
+				return ''
+			}
+			text = text.trim()
+			if (text === '') return ''
+			const anchor = selection.anchorNode
+			const element = anchor !== null && anchor !== undefined
+				? (anchor.nodeType === 1 ? anchor : anchor.parentElement)
+				: null
+			if (element !== null && element !== undefined && typeof element.closest === 'function') {
+				if (element.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], [' + CONTEXT_MENU_ATTR + ']') !== null) return ''
+			}
+			return text.length > SELECTION_LIMIT ? text.slice(0, SELECTION_LIMIT) + '…' : text
+		}
+
+		/** Remove the floating selection menu, if one is open. */
+		function closeContextMenu() {
+			if (contextMenuElement !== null) {
+				contextMenuElement.remove()
+				contextMenuElement = null
+			}
+		}
+
+		/**
+		 * Show one line of feedback without touching the panel's own toast row.
+		 * @param message - the localised text.
+		 */
+		function showFloatingToast(message) {
+			if (floatingToastElement !== null) {
+				floatingToastElement.remove()
+				floatingToastElement = null
+			}
+			if (floatingToastTimer !== null) {
+				clearTimeout(floatingToastTimer)
+				floatingToastTimer = null
+			}
+			const toast = document.createElement('div')
+			toast.className = 'dswc-floatingToast'
+			toast.textContent = message
+			document.body.appendChild(toast)
+			floatingToastElement = toast
+			floatingToastTimer = setTimeout(() => {
+				toast.remove()
+				floatingToastElement = null
+				floatingToastTimer = null
+			}, 4600)
+		}
+
+		//#endregion
+
 		//#region ui
 
 		/**
@@ -2657,6 +2761,114 @@ window.__ModuleLoader__.load({
 				name: 'main',
 				key: SIDEBAR_ENTRY_ID,
 			}, WebChatDoor)), 'deepseek-webchat: sidebar door view')
+
+			/**
+			 * Put a right-clicked selection into the Web Chat composer.
+			 *
+			 * Opens the Web Chat tab first, then waits for the guest and its composer:
+			 * a fresh tab can still be loading the site when the menu item is clicked,
+			 * so filling immediately would just report "no composer".
+			 * @param rawText - the selected text.
+			 */
+			async function pushSelectionToWebChat(rawText) {
+				const quoted = quoteSelection(rawText, t('ctxmenu.preamble'))
+				// Context handoff is a DeepSeek capability; the panel may be showing
+				// another site, so come back to DeepSeek before filling.
+				if (activeSiteId !== 'deepseek') {
+					try {
+						await switchSite('deepseek')
+					} catch (error) {
+						// A failed switch is reported by the panel itself.
+					}
+				}
+				let opened = openDoor()
+				const deadline = Date.now() + 14000
+				while (Date.now() < deadline) {
+					if (!opened) opened = openDoor()
+					if (guest !== null) {
+						const filled = await fillComposer(quoted)
+						if (filled !== null && filled !== undefined && filled.ok === true) {
+							showFloatingToast(format(t('toast.selectionFilled'), { count: filled.length ?? quoted.length }))
+							try {
+								guest.element.focus()
+							} catch (error) {
+								// Focus is best effort.
+							}
+							return
+						}
+					}
+					await new Promise((resolve) => setTimeout(resolve, 250))
+				}
+				showFloatingToast(t('toast.selectionNoComposer'))
+			}
+
+			/**
+			 * Open the floating menu for one selection.
+			 * @param x - viewport x.
+			 * @param y - viewport y.
+			 * @param text - the selected text.
+			 */
+			function openSelectionMenu(x, y, text) {
+				closeContextMenu()
+				const menu = document.createElement('div')
+				menu.className = 'dswc-ctxmenu'
+				menu.setAttribute(CONTEXT_MENU_ATTR, '')
+				menu.style.left = Math.max(8, Math.min(x, (window.innerWidth ?? 1200) - 260)) + 'px'
+				menu.style.top = Math.max(8, Math.min(y, (window.innerHeight ?? 800) - 96)) + 'px'
+				const item = document.createElement('button')
+				item.type = 'button'
+				item.className = 'dswc-ctxmenuItem'
+				item.textContent = t('ctxmenu.webchat')
+				item.addEventListener('click', () => {
+					closeContextMenu()
+					void pushSelectionToWebChat(text)
+				})
+				const hint = document.createElement('div')
+				hint.className = 'dswc-ctxmenuHint'
+				hint.textContent = format(t('ctxmenu.selection'), { count: text.length })
+				menu.appendChild(item)
+				menu.appendChild(hint)
+				document.body.appendChild(menu)
+				contextMenuElement = menu
+			}
+
+			ctx.effect(() => {
+				const onContextMenu = (event) => {
+					if (event.defaultPrevented === true) return
+					const target = event.target
+					if (target !== null && typeof target === 'object' && typeof target.closest === 'function'
+						&& target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], .dswc-ctxmenu') !== null) return
+					const text = readSelectedText()
+					if (text === '') return
+					event.preventDefault()
+					openSelectionMenu(event.clientX, event.clientY, text)
+				}
+				const onMouseDown = (event) => {
+					if (contextMenuElement === null) return
+					const target = event.target
+					if (target !== null && typeof target === 'object' && typeof contextMenuElement.contains === 'function'
+						&& contextMenuElement.contains(target)) return
+					closeContextMenu()
+				}
+				const onKeyDown = (event) => {
+					if (event.key === 'Escape') closeContextMenu()
+				}
+				const onViewportChange = () => closeContextMenu()
+				document.addEventListener('contextmenu', onContextMenu, true)
+				document.addEventListener('mousedown', onMouseDown, true)
+				document.addEventListener('keydown', onKeyDown, true)
+				window.addEventListener('scroll', onViewportChange, true)
+				window.addEventListener('resize', onViewportChange)
+				return () => {
+					document.removeEventListener('contextmenu', onContextMenu, true)
+					document.removeEventListener('mousedown', onMouseDown, true)
+					document.removeEventListener('keydown', onKeyDown, true)
+					window.removeEventListener('scroll', onViewportChange, true)
+					window.removeEventListener('resize', onViewportChange)
+					closeContextMenu()
+				}
+			}, 'deepseek-webchat: selection context menu')
+
 			ctx.effect(() => () => {
 				disposeGuest()
 			}, 'deepseek-webchat: guest lifetime')

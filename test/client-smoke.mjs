@@ -22,20 +22,91 @@ const check = (ok, message) => {
 }
 
 // ---------------------------------------------------------------- DOM + React
-const fakeElement = () => ({
-  setAttribute() {}, getAttribute() { return null }, appendChild() {}, remove() {},
-  textContent: '', style: {}, addEventListener() {}, removeEventListener() {},
-  querySelector() { return null }, querySelectorAll() { return [] }, parentElement: null,
-})
+const makeElement = (tagName = 'div') => {
+  const element = {
+    tagName: String(tagName).toUpperCase(),
+    children: [],
+    listeners: new Map(),
+    style: {},
+    className: '',
+    textContent: '',
+    type: '',
+    attrs: {},
+    parentElement: null,
+    setAttribute(key, value) { this.attrs[key] = value },
+    getAttribute(key) { return this.attrs[key] ?? null },
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child },
+    remove() {
+      if (this.parentElement !== null) {
+        const index = this.parentElement.children.indexOf(this)
+        if (index >= 0) this.parentElement.children.splice(index, 1)
+      }
+    },
+    addEventListener(type, fn) {
+      const list = this.listeners.get(type) ?? []
+      list.push(fn)
+      this.listeners.set(type, list)
+    },
+    removeEventListener(type, fn) {
+      const list = this.listeners.get(type)
+      if (list === undefined) return
+      const index = list.indexOf(fn)
+      if (index >= 0) list.splice(index, 1)
+    },
+    contains(other) { return other === this || this.children.includes(other) },
+    closest() { return null },
+    focus() {},
+    querySelector() { return null },
+    querySelectorAll() { return [] },
+    getBoundingClientRect() { return { left: 0, top: 0, width: 200, height: 40 } },
+  }
+  return element
+}
+const documentListeners = new Map()
+const addDocumentListener = (type, fn) => {
+  const list = documentListeners.get(type) ?? []
+  list.push(fn)
+  documentListeners.set(type, list)
+}
+const removeDocumentListener = (type, fn) => {
+  const list = documentListeners.get(type)
+  if (list === undefined) return
+  const index = list.indexOf(fn)
+  if (index >= 0) list.splice(index, 1)
+}
+const fireDocument = (type, event) => {
+  for (const fn of [...(documentListeners.get(type) ?? [])]) fn(event)
+}
+const bodyElement = makeElement('body')
+const headElement = makeElement('head')
 globalThis.document = {
-  head: { appendChild() {} },
-  body: { appendChild() {} },
-  documentElement: fakeElement(),
+  head: headElement,
+  body: bodyElement,
+  documentElement: makeElement('html'),
   cookie: '',
-  createElement: () => fakeElement(),
+  createElement: (tagName) => makeElement(tagName),
   querySelector: () => null,
   querySelectorAll: () => [],
+  addEventListener: addDocumentListener,
+  removeEventListener: removeDocumentListener,
+}
+let selectedText = ''
+const selectionAnchor = makeElement('span')
+globalThis.window = {
   addEventListener() {}, removeEventListener() {},
+  getSelection: () => ({
+    toString: () => selectedText,
+    anchorNode: selectionAnchor,
+  }),
+  __ModuleLoader__: {
+    load({ id, factory }) {
+      loaded.id = id
+      loaded.module = factory((name) => {
+        if (name === 'react') return React
+        throw new Error('unexpected require: ' + name)
+      })
+    },
+  },
 }
 const React = {
   createElement: (type, props, ...children) => ({ type, props, children }),
@@ -49,18 +120,6 @@ const React = {
   useSyncExternalStore: (getSnapshot) => getSnapshot(),
 }
 const loaded = {}
-globalThis.window = {
-  addEventListener() {}, removeEventListener() {},
-  __ModuleLoader__: {
-    load({ id, factory }) {
-      loaded.id = id
-      loaded.module = factory((name) => {
-        if (name === 'react') return React
-        throw new Error('unexpected require: ' + name)
-      })
-    },
-  },
-}
 // eslint-disable-next-line no-eval
 eval(code)
 
@@ -69,11 +128,13 @@ check(loaded.id === 'dsh-deepseek-webchat', `bundle registered as ${String(loade
 // ---------------------------------------------------------------- mock ctx
 const registrations = []
 const applyErrors = []
+const openTabCalls = []
+const disposers = []
 const ctx = {
   effect(fn, label) {
     try {
       const dispose = fn()
-      if (typeof dispose === 'function') dispose()
+      if (typeof dispose === 'function') disposers.push(dispose)
     } catch (error) {
       applyErrors.push(label + ': ' + String(error))
     }
@@ -84,7 +145,10 @@ const ctx = {
   },
   locale: { register() { return () => {} }, bind() { return (key) => key } },
   sidebarRightTabs: { register() { return () => {} } },
-  sidebarRight: { openTab() {}, openTabIn() {} },
+  sidebarRight: {
+    openTab(kind, options) { openTabCalls.push({ kind, options }) },
+    openTabIn() {},
+  },
   get() { return undefined },
 }
 loaded.module.apply(ctx)
@@ -144,10 +208,40 @@ if (select !== null) {
   check(after?.props?.value === 'chatgpt', 'switching to chatgpt did not update the selection')
 }
 
+// ---------------------------------------------------------------- right-click handoff
+check((documentListeners.get('contextmenu')?.length ?? 0) > 0, 'no document contextmenu listener was installed')
+check((documentListeners.get('mousedown')?.length ?? 0) > 0, 'no document mousedown listener was installed')
+
+selectedText = '选中的第一行\n选中的第二行'
+const contextEvent = {
+  defaultPrevented: false,
+  target: makeElement('div'),
+  clientX: 120,
+  clientY: 160,
+  preventDefault() { this.defaultPrevented = true },
+}
+fireDocument('contextmenu', contextEvent)
+check(contextEvent.defaultPrevented === true, 'a text selection should suppress the native menu')
+const menu = bodyElement.children.find((child) => child.className === 'dswc-ctxmenu')
+check(menu !== undefined, 'no floating selection menu was appended')
+const menuItem = menu?.children.find((child) => child.tagName === 'BUTTON' && child.className === 'dswc-ctxmenuItem')
+check(menuItem !== undefined, 'the selection menu has no Web Chat item')
+check(menuItem?.textContent === 'ctxmenu.webchat', 'the menu item copy is missing: ' + String(menuItem?.textContent))
+const hint = menu?.children.find((child) => child.className === 'dswc-ctxmenuHint')
+check(hint !== undefined && hint.textContent.includes('ctxmenu.selection'), 'the menu hint copy is missing')
+
+// Clicking the item opens the Web Chat tab (the composer may not exist in this mock).
+menuItem.listeners.get('click')?.[0]?.()
+await new Promise((resolve) => setTimeout(resolve, 80))
+check(openTabCalls.length > 0, 'clicking the menu item did not open the Web Chat tab')
+check(openTabCalls[0].kind === 'deepseek-webchat', 'wrong tab kind opened: ' + String(openTabCalls[0].kind))
+check(!bodyElement.children.some((child) => child.className === 'dswc-ctxmenu'), 'the menu should close once clicked')
+
 // ---------------------------------------------------------------- report
 if (failures.length > 0) {
   console.error('client-smoke: FAIL')
   for (const failure of failures) console.error('  - ' + failure)
   process.exit(1)
 }
-console.log('client-smoke: PASS (apply + 4-site dropdown + site switch)')
+console.log('client-smoke: PASS (apply + 4-site dropdown + site switch + right-click handoff)')
+process.exit(0)
