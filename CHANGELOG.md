@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.7.0-multisite
+
+### Added
+- **「引用上下文」支持全部四个站点**（此前只有 DeepSeek）：勾选 Harness 会话里的消息
+  → 生成 `>` 引用块 → 填入**当前站点**的输入框，无需切回 DeepSeek。
+  - 按站点接入各自的 composer 适配器：
+    - DeepSeek：React 受控 `<textarea>`（原生 value setter + `input`/`change` 事件）；
+    - ChatGPT：ProseMirror 编辑器（`#prompt-textarea`，含 `.ProseMirror` 兜底）；
+    - Claude：回复区 fieldset 里的 ProseMirror（含通用 contenteditable 兜底）；
+    - Gemini：`<rich-textarea>` 里的 Quill（`.ql-editor`，含通用兜底）。
+  - contenteditable 的写入策略：先记下输入框原有内容，选中全部内容后，单行走编辑器
+    自己的 `insertText`，多行走合成 `paste`（富文本编辑器会把每行拆成段落，引用块不会
+    糊成一行）；写完读回比对，内容确实变了才算成功，没变才尝试下一条路径，因此不会重复
+    写入，也不会把输入框里原有的草稿误判成「已经写入」；全部路径失败则返回失败，由面板
+    提示，而不是假装写入成功。最后还有 `textContent` 兜底。写入前补发 `selectionchange`。
+  - 输入框里已有草稿时按「替换」处理（与 DeepSeek 覆盖 `.value` 的行为一致），失败时
+    草稿保持原样。
+  - 选择器链全部限定在对应站点的输入框容器内（ChatGPT 的 `form`、Claude 的 `fieldset`、
+    Gemini 的 `rich-textarea`），避免网页改版后命中页面上其它 contenteditable。
+  - 发送兜底（找不到 Enter 效果时点发送按钮）只在输入框所在 `form`（或输入框附近的
+    垂直范围内）找按钮，避免误点侧栏的「Send feedback」。
+  - 发送仍走「在输入框上派发 Enter 键」的既有思路（四个站点都用 Enter 发送），
+    失效时再找带 send / submit / 发送 的无障碍名称按钮。
+- **右键接力跟随当前站点**：选中 DSH 文字 → 「在 Web Chat 中继续」现在填入当前显示的
+  站点，不再强制切回 DeepSeek；等待 guest 落到该站点后才写入。
+- 新增冒烟测试：四个站点都必须有「引用上下文」按钮；逐个站点检查 composer 脚本的
+  选择器、编辑器命令路径、粘贴兜底、`selectionchange` 与换行检测；并用模拟编辑器
+  执行 `fillScript`，覆盖单行 / 多行 / 兜底 / 已有草稿 / 只读编辑器五种情况，确认
+  只写入一次、草稿被替换、失败时不会误报成功。
+
+### Changed
+- 文案去掉「仅 DeepSeek 支持上下文接力」的说法：`status.site`、`settings.deepseekNote`、
+  引用预览标题与提示、填入 / 发送 / 找不到输入框的 toast 都改为带 `{site}` 的站点名；
+  设置页说明改为「上下文引用四站点可用；会话绑定与登录快照仅 DeepSeek」。
+- 文件头注释与 `pushSelectionToWebChat` 注释同步更新。
+
 ## 0.6.1-multisite
 
 ### Added

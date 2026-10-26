@@ -7,8 +7,8 @@
 在 **DeepSeek Harness Desktop** 的左侧栏里加一个 **Web Chat** 面板：用桌面端原生
 browser guest（不是 iframe）托管**真实网页版**聊天，工具栏下拉即可在
 **DeepSeek / ChatGPT / Gemini / Claude** 之间切换，登录态、对话历史都是各站点自己的网页版。
-DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepSeek 对话、把 Harness
-会话里的消息勾选后填入 DeepSeek 输入框、重启后恢复登录。
+**四个站点都能「引用上下文」**：勾选 Harness 会话里的消息，整理成 `>` 引用块填进当前站点
+的输入框；DeepSeek 站点另外保留上游的会话绑定与登录快照恢复。
 
 ## 功能
 
@@ -22,14 +22,22 @@ DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepS
 - **设置页**：`设置 → Web Chat` 可选择**默认网页**（四站点任选，改完立即切换当前面板）、
   开关「启动 DSH 时自动打开 Web Chat」，以及一键打开面板。
 - **右键接力**：在 DSH 对话里选中文字 → 右键 → **在 Web Chat 中继续**。
-  自动打开 Web Chat 并把选中内容按 `>` 引用格式填入网页版输入框（不自动发送）。
+  自动打开 Web Chat 并把选中内容按 `>` 引用格式填入**当前站点**的输入框（不自动发送）。
+- **引用上下文（四站点通用）**：勾选 Harness 会话中的消息 / AI 提问 / 你的回答 / 待办，
+  生成引用块后填入当前站点的输入框，可「仅填入」或「填入并发送」（默认不包含 reasoning、
+  工具调用与结果，避免泄露）。各站点输入框适配：
+  - DeepSeek：React 受控 `<textarea>`（原生 value setter + input 事件）；
+  - ChatGPT / Claude：ProseMirror 编辑器（`#prompt-textarea` / fieldset 里的 `.ProseMirror`）；
+  - Gemini：`<rich-textarea>` 里的 Quill 编辑器（`.ql-editor`）。
+  单行内容走编辑器的 `insertText`，多行走合成 `paste`（富文本编辑器会把每行拆成段落，
+  引用块不会糊成一行）。写入前先记下输入框原有内容，写完再读一次比对：内容变了才算成功，
+  没变才尝试下一条路径（所以不会重复写入），全部失败则明确报错而不是假装成功；输入框里
+  已有的草稿会被引用内容替换（与 DeepSeek 的覆盖行为一致）。每条选择器链都限定在对应
+  站点的输入框容器内（`form` / `fieldset` / `rich-textarea`），不会写到页面上别的可编辑框。
 - **DeepSeek 专属能力保留**：
   - 每个 DSH 会话 ↔ 一个 DeepSeek 对话自动绑定（切换会话时右侧面板跟着切）；
-  - 「引用上下文」：勾选 Harness 会话中的消息 / AI 提问 / 你的回答 / 待办，填入 DeepSeek
-    输入框并可一键发送（默认不包含 reasoning、工具调用与结果，避免泄露）；
   - 登录快照恢复：应用重启后自动恢复 DeepSeek 网页登录（凭据在本机 localStorage）。
-- **其它站点自动降级**：切到 ChatGPT / Gemini / Claude 时，DeepSeek 专属按钮自动隐藏，
-  只保留刷新与站点切换。
+  - 切到 ChatGPT / Gemini / Claude 时，绑定状态与「解除绑定」按钮自动隐藏。
 - **无遥测**：插件自身不发起任何网络请求；唯一的流量是各网页版自己访问自己的服务器。
 
 ## 环境要求
@@ -42,7 +50,7 @@ DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepS
 ## 安装（DMG，推荐）
 
 1. 从 [Releases](https://github.com/SeyanaA/dsh-web-chat-multisite/releases/latest) 下载
-   `Web-Chat-for-DSH-0.6.1-multisite.dmg` 并双击打开；
+   `Web-Chat-for-DSH-0.7.0-multisite.dmg` 并双击打开；
 2. **先完全退出 DeepSeek Harness（⌘Q）**（安装脚本会检查并提示）；
 3. 双击 DMG 里的 **安装 Web Chat.command**；
    - 如果 macOS 提示「无法验证开发者」：右键该文件 →「打开」→ 再点「打开」；
@@ -75,8 +83,9 @@ DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepS
 
 1. 左侧栏点 **Web Chat**，右侧打开面板；
 2. 顶部下拉选择 **DeepSeek / ChatGPT / Gemini / Claude**，等页面加载后登录；
-3. 在 DeepSeek 站点里发一条消息后，当前 DSH 会话会自动与它绑定（状态点变绿）；
-4. 点「引用上下文」把 Harness 里的内容整理后填入 DeepSeek 输入框；
+3. 点「引用上下文」勾选 Harness 里的消息，生成引用块后填入**当前站点**的输入框
+   （四个站点都适用，不必切回 DeepSeek）；
+4. 在 DeepSeek 站点里发一条消息后，当前 DSH 会话会自动与它绑定（状态点变绿）；
 5. 想换站点随时切，互不影响。
 
 ## 登录态说明（重要）
@@ -98,7 +107,9 @@ DeepSeek 站点保留上游的全部能力：每个 DSH 会话绑定一个 DeepS
 
 - 仅桌面端可用；纯 `dsh web` 会提示不支持。
 - 同一站点一个 Web Chat Tab（按 DSH 会话）。
-- 网页改版可能影响「引用上下文」的输入框定位；嵌入、站点切换、登录不影响。
+- 网页改版可能影响「引用上下文」的输入框定位：四个站点各有一组限定在输入框容器内的
+  候选选择器，改版后最坏情况是提示「没找到 {站点} 输入框」或「写入失败」，不会把内容
+  写进页面上的其它可编辑框；嵌入、站点切换、登录不受影响。
 - 本插件改动的是 `~/.dsh/profiles/...` 下的第三方插件；上游升级会覆盖（本仓库 DMG
   可随时重装本版本）。
 
@@ -119,7 +130,7 @@ docs/CHANGES-vs-upstream.diff   # 与上游 0.4.10 的完整代码差异
 冒烟测试：
 
 ```bash
-node test/client-smoke.mjs   # 用 mock ctx/React 执行 client bundle apply，渲染面板并检查下拉
+node test/client-smoke.mjs   # mock ctx/React 执行 client bundle：面板渲染、站点下拉、四站点引用按钮、composer 脚本行为
 node test/host-snapshot.mjs  # 宿主端会话快照 v1→v2 迁移与按站点读写
 ```
 

@@ -1,5 +1,20 @@
 基于上游 [Ckarefulon/dsh-deepseek-webchat](https://github.com/Ckarefulon/dsh-deepseek-webchat) v0.4.10（MIT）的二次开发版本。
 
+## 0.7.0-multisite · 四个站点都能引用上下文
+
+- **「引用上下文」不再只对 DeepSeek 生效**：切到 ChatGPT / Gemini / Claude 时按钮照常出现，
+  勾选 Harness 会话里的消息后，引用块直接填入当前站点的输入框（仅填入 / 填入并发送）；
+- 每个站点有自己的输入框适配：DeepSeek 的 React textarea、ChatGPT 与 Claude 的
+  ProseMirror、Gemini 的 Quill；单行用 `insertText`、多行走合成粘贴（每行独立成段），
+  写完读回比对确认真的写进去了：不会重复写入、不会把已有草稿误报成成功，也不会写进
+  页面上别的可编辑框；已有草稿会被引用内容替换；
+- **右键接力跟随当前站点**：不再强制切回 DeepSeek 才填入；
+- 设置页说明改为「上下文引用四站点可用，会话绑定与登录快照仅 DeepSeek」；
+- 冒烟测试新增四站点按钮检查、composer 脚本断言，以及模拟编辑器下的单行 / 多行 /
+  兜底写入验证。
+
+`Web-Chat-for-DSH-0.7.0-multisite.dmg`
+
 ## 0.6.1-multisite · 新增设置页
 
 - **设置 → Web Chat**：默认网页（DeepSeek / ChatGPT / Gemini / Claude）四选一，改完立即

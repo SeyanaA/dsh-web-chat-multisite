@@ -3,7 +3,17 @@
  *
  * A sidebar tab that shows a **real** web-chat site — DeepSeek by default, with
  * ChatGPT, Gemini and Claude selectable from a toolbar dropdown — and lets you
- * push selected DSH messages into the DeepSeek composer by hand.
+ * push selected DSH messages into the composer of whichever site is showing.
+ *
+ * ## Four sites, four editor models
+ *
+ * DeepSeek's composer is a React-controlled `<textarea>`, so a fill is a native
+ * value write plus an `input` event. ChatGPT and Claude run ProseMirror, and
+ * Gemini runs Quill inside `<rich-textarea>`; those editors own their document,
+ * so a fill is a DOM selection plus an `insertText` command (single line) or a
+ * synthetic `paste` (several lines). `COMPOSER_ADAPTERS` holds the per-site
+ * selector chains and editing kind; nothing above that layer knows which site
+ * it is writing to.
  *
  * ## Why this is not an iframe
  *
@@ -39,11 +49,12 @@
  *
  * ## What this half never does
  *
- * It never sends anything to DeepSeek on its own. Selecting messages composes a
- * blockquote and *fills the composer*; pressing Enter is the human's move. It
- * never reads a DeepSeek answer back into the DSH conversation, and it never
- * quotes system, developer or injected-prompt events — those are filtered by the
- * host half before they reach the picker.
+ * It never sends anything to a site on its own. Selecting messages composes a
+ * blockquote and *fills the composer*; pressing Enter is the human's move (the
+ * explicit 「填入并发送」 action is the one exception, and it is a click). It
+ * never reads a web answer back into the DSH conversation, and it never quotes
+ * system, developer or injected-prompt events — those are filtered by the host
+ * half before they reach the picker.
  */
 
 window.__ModuleLoader__.load({
@@ -156,7 +167,7 @@ window.__ModuleLoader__.load({
 			'guide.title': 'Web Chat',
 			'guide.description': '在侧边栏打开网页版聊天（DeepSeek / ChatGPT / Gemini / Claude）',
 			'site.title': '网页站点',
-			'status.site': '当前站点：{site}（仅 DeepSeek 支持上下文接力）',
+			'status.site': '当前站点：{site}',
 			'settings.title': 'Web Chat',
 			'settings.defaultSite': '默认网页',
 			'settings.defaultSiteHint': '打开 Web Chat 时默认显示的网页；切换后当前面板也会跟着切换。',
@@ -164,7 +175,7 @@ window.__ModuleLoader__.load({
 			'settings.autoOpenHint': '应用启动后展开右侧 Web Chat 面板；需要当前已有会话。',
 			'settings.autoOpenShort': '开启',
 			'settings.open': '打开 Web Chat',
-			'settings.deepseekNote': '上下文引用与自动填入仅对 DeepSeek 生效。',
+			'settings.deepseekNote': '上下文引用与自动填入在四个站点都可用；会话绑定与登录快照仅对 DeepSeek 生效。',
 			'action.send': '引用上下文',
 			'action.back': '返回网页',
 			'action.reload': '刷新',
@@ -198,23 +209,23 @@ window.__ModuleLoader__.load({
 			'picker.kind.command': '命令',
 			'picker.kind.summary': '摘要',
 			'picker.preamble': '附上说明',
-			'picker.preambleHint': '在引用内容前面加一小段说明，告诉 DeepSeek 这些内容是什么、来自哪里。',
+			'picker.preambleHint': '在引用内容前面加一小段说明，告诉对方这些内容是什么、来自哪里。',
 			'picker.preambleText': '以下是我在另一个 AI 助手（DSH）里的对话片段，引用给你作为背景参考。以「> 」开头的行是原文，【】里标出的是这段内容属于谁（用户、助手、提问、回答、工具调用等）。请先理解这些背景，再回答我最下面的问题；如果背景里有不清楚的地方，请直接指出。',
 			'picker.lastCount': '末尾条数',
 			'picker.question': '要一起发送的问题或指令（可选）',
 			'picker.questionPlaceholder': '例如：请基于以上内容，帮我补充一个更完整的方案。',
-			'picker.preview': '将填入 DeepSeek 输入框的内容',
-			'picker.hint': '点「填入并发送」会直接把预览内容发给 DeepSeek；想先自己确认就点「仅填入」。两种情况都不会改动 DSH 里的对话。',
-			'toast.sent': '已发送到 DeepSeek（{count} 字）。',
-			'toast.sendPending': '已填入 DeepSeek 输入框，但自动发送没有生效 —— 请手动按 Enter。',
+			'picker.preview': '将填入 {site} 输入框的内容',
+			'picker.hint': '点「填入并发送」会直接把预览内容发给 {site}；想先自己确认就点「仅填入」。两种情况都不会改动 DSH 里的对话。',
+			'toast.sent': '已发送到 {site}（{count} 字）。',
+			'toast.sendPending': '已填入 {site} 输入框，但自动发送没有生效 —— 请手动按 Enter。',
 			'status.bound': '已绑定 DeepSeek 会话 {id}',
 			'status.unbound': '未绑定 —— 在 DeepSeek 里发出第一条消息后自动绑定',
 			'status.nobridge': '当前环境没有桌面浏览器通道，无法嵌入真实网页版。',
 			'status.nobridgeHint': '请在 DSH 桌面版里使用；`dsh web` 之类的普通网页 profile 不带这个通道。',
 			'status.failed': '嵌入失败：{error}',
 			'status.filling': '正在填入…',
-			'toast.filled': '已填入 DeepSeek 输入框（{count} 字），请手动按 Enter 发送。',
-			'toast.nocomposer': '没找到 DeepSeek 输入框，请先在网页里打开一个对话。',
+			'toast.filled': '已填入 {site} 输入框（{count} 字），请手动按 Enter 发送。',
+			'toast.nocomposer': '没找到 {site} 输入框，请先在网页里打开一个对话并登录。',
 			'toast.copied': '已复制到剪贴板。',
 			'toast.rebound': '已解除绑定，下次打开将新建对话。',
 			'ctxmenu.webchat': '在 Web Chat 中继续',
@@ -229,7 +240,7 @@ window.__ModuleLoader__.load({
 			'guide.title': 'Web Chat',
 			'guide.description': 'Open a web chat in the sidebar (DeepSeek / ChatGPT / Gemini / Claude)',
 			'site.title': 'Web chat site',
-			'status.site': 'Site: {site} (context handoff works on DeepSeek only)',
+			'status.site': 'Site: {site}',
 			'settings.title': 'Web Chat',
 			'settings.defaultSite': 'Default site',
 			'settings.defaultSiteHint': 'The page Web Chat opens with. Changing it also switches the open panel.',
@@ -237,7 +248,7 @@ window.__ModuleLoader__.load({
 			'settings.autoOpenHint': 'Reveal the right-hand Web Chat pane after launch. Needs an open session.',
 			'settings.autoOpenShort': 'On',
 			'settings.open': 'Open Web Chat',
-			'settings.deepseekNote': 'Quote context and auto-fill work on DeepSeek only.',
+			'settings.deepseekNote': 'Quote context and auto-fill work on all four sites; session binding and the saved login apply to DeepSeek only.',
 			'action.send': 'Quote context',
 			'action.back': 'Back to page',
 			'action.reload': 'Reload',
@@ -271,23 +282,23 @@ window.__ModuleLoader__.load({
 			'picker.kind.command': 'Command',
 			'picker.kind.summary': 'Summary',
 			'picker.preamble': 'Add a note',
-			'picker.preambleHint': 'Put a short note in front of the quoted text, telling DeepSeek what it is and where it came from.',
+			'picker.preambleHint': 'Put a short note in front of the quoted text, telling the site what it is and where it came from.',
 			'picker.preambleText': 'Below are excerpts from a conversation I had with another AI assistant (DSH), quoted as background. Lines starting with "> " are the original text, and 【...】 marks who that piece came from (user, assistant, question, answer, tool call, and so on). Please read them for context, then answer my question at the very end; say so if anything in the background is unclear.',
 			'picker.lastCount': 'How many',
 			'picker.question': 'Question or instruction to send along (optional)',
 			'picker.questionPlaceholder': 'e.g. Based on the above, help me draft a more complete plan.',
-			'picker.preview': 'What will be sent to DeepSeek',
-			'picker.hint': 'Fill and send puts the preview straight into DeepSeek and submits it; use Fill only if you want to check it first. Neither touches your DSH conversation.',
-			'toast.sent': 'Sent to DeepSeek ({count} chars).',
-			'toast.sendPending': 'Filled the DeepSeek composer, but the automatic send did not take — press Enter there yourself.',
+			'picker.preview': 'What will be sent to {site}',
+			'picker.hint': 'Fill and send puts the preview straight into {site} and submits it; use Fill only if you want to check it first. Neither touches your DSH conversation.',
+			'toast.sent': 'Sent to {site} ({count} chars).',
+			'toast.sendPending': 'Filled the {site} composer, but the automatic send did not take — press Enter there yourself.',
 			'status.bound': 'Bound to DeepSeek conversation {id}',
 			'status.unbound': 'Unbound — binds automatically after the first message is sent in DeepSeek',
 			'status.nobridge': 'No desktop browser channel here, so the real web app cannot be embedded.',
 			'status.nobridgeHint': 'Use the DSH desktop app; a plain `dsh web` profile does not carry this channel.',
 			'status.failed': 'Embedding failed: {error}',
 			'status.filling': 'Filling…',
-			'toast.filled': 'Filled the DeepSeek composer ({count} chars) — press Enter yourself to send.',
-			'toast.nocomposer': 'No DeepSeek composer found. Open a conversation in the page first.',
+			'toast.filled': 'Filled the {site} composer ({count} chars) — press Enter yourself to send.',
+			'toast.nocomposer': 'No {site} composer found. Open a conversation in the page first.',
 			'toast.copied': 'Copied to the clipboard.',
 			'toast.rebound': 'Binding cleared; the next visit starts a new conversation.',
 			'ctxmenu.webchat': 'Continue in Web Chat',
@@ -1710,27 +1721,91 @@ window.__ModuleLoader__.load({
 			}))
 		}
 
-		/** How the guest finds the composer, most specific selector first. */
-		const COMPOSER_PICK = 'document.querySelector("textarea.ds-textarea__textarea")'
+		/** How the guest finds DeepSeek's composer, most specific selector first. */
+		const DEEPSEEK_COMPOSER_PICK = 'document.querySelector("textarea.ds-textarea__textarea")'
 			+ ' || document.querySelector("textarea[placeholder]")'
 			+ ' || document.querySelector("textarea")'
 
 		/**
-		 * The script that fills the DeepSeek composer.
+		 * How the guest finds ChatGPT's composer, most specific selector first.
 		 *
-		 * The composer is a React-controlled `<textarea class="ds-textarea__textarea">`
-		 * (the class is built as `"ds" + "-textarea__textarea"` in DeepSeek's own
-		 * bundle). Writing `.value` directly is ignored by React, so the native
-		 * value setter is used and an `input` event is dispatched, which is what
-		 * makes React commit the change.
+		 * The composer is a ProseMirror contenteditable `#prompt-textarea`; the
+		 * remaining selectors are what survives a rename and a logged-out page.
+		 * Every fallback stays anchored to a `form`, because an unscoped match for
+		 * `[contenteditable]` returns the first editor in document order — the
+		 * canvas or a message editor — and a fill into the wrong box is worse than
+		 * a reported "no composer".
+		 */
+		const CHATGPT_COMPOSER_PICK = 'document.querySelector("#prompt-textarea")'
+			+ ' || document.querySelector("form div.ProseMirror[contenteditable=true]")'
+			+ ' || document.querySelector("form div[contenteditable=true][role=textbox]")'
+
+		/** Claude's composer: ProseMirror inside the reply fieldset. */
+		const CLAUDE_COMPOSER_PICK = 'document.querySelector("fieldset div.ProseMirror[contenteditable=true]")'
+			+ ' || document.querySelector("fieldset div[contenteditable=true][role=textbox]")'
+			+ ' || document.querySelector("div.ProseMirror[contenteditable=true][role=textbox]")'
+
+		/** Gemini's composer: a Quill editor inside `<rich-textarea>`. */
+		const GEMINI_COMPOSER_PICK = 'document.querySelector("rich-textarea div.ql-editor[contenteditable=true]")'
+			+ ' || document.querySelector("rich-textarea [contenteditable=true][role=textbox]")'
+			+ ' || document.querySelector("div.ql-editor[contenteditable=true]")'
+
+		/**
+		 * The per-site composer adapters.
+		 *
+		 * `kind` decides how text is written: `textarea` goes through the native
+		 * value setter and an `input` event (React-controlled), `editable` through
+		 * the editor's own command path because a rich-text editor owns its
+		 * document and ignores `.value`/`.textContent` writes.
+		 *
+		 * Every site lists its selectors most specific first, so a UI rename
+		 * degrades to a generic contenteditable match instead of reporting that a
+		 * composer plainly on screen does not exist.
+		 */
+		const COMPOSER_ADAPTERS = Object.freeze({
+			deepseek: Object.freeze({ kind: 'textarea', pick: DEEPSEEK_COMPOSER_PICK }),
+			chatgpt: Object.freeze({ kind: 'editable', pick: CHATGPT_COMPOSER_PICK }),
+			gemini: Object.freeze({ kind: 'editable', pick: GEMINI_COMPOSER_PICK }),
+			claude: Object.freeze({ kind: 'editable', pick: CLAUDE_COMPOSER_PICK }),
+		})
+
+		/**
+		 * @param siteId - a site id.
+		 * @returns that site's composer adapter, falling back to DeepSeek's.
+		 */
+		function composerAdapter(siteId) {
+			return COMPOSER_ADAPTERS[siteById(siteId).id] ?? COMPOSER_ADAPTERS.deepseek
+		}
+
+		/**
+		 * The script that fills the current site's composer.
+		 *
+		 * Every site answers `{ ok, length }`; which editing model gets there is
+		 * the adapter's business.
+		 *
+		 * A React-controlled `<textarea>` (DeepSeek) ignores a `.value` write, so
+		 * the native value setter is used and an `input` event is dispatched,
+		 * which is what makes React commit the change.
+		 *
+		 * A contenteditable editor (ChatGPT, Gemini, Claude) owns its document:
+		 * the text is written by replacing the current selection. The fixed
+		 * sequence is deliberate — the editor's own `insertText` command for one
+		 * line, a synthetic `paste` for several (a rich-text editor splits a
+		 * pasted line into a paragraph, which is what keeps a quoted block
+		 * readable), each attempted only while the editor still reads as empty so
+		 * that no path can insert the text twice. A final `textContent` write
+		 * keeps an editor neither path recognises usable.
 		 * @param text - the text to place in the composer.
+		 * @param siteId - the site whose composer is being filled.
 		 * @returns a self-contained script expression.
 		 */
-		function fillScript(text) {
+		function fillScript(text, siteId) {
+			const adapter = composerAdapter(siteId)
+			if (adapter.kind === 'editable') return editableFillScript(text, adapter.pick)
 			return '(function () {'
 				+ ' try {'
 				+ ' var text = ' + JSON.stringify(text) + ';'
-				+ ' var el = ' + COMPOSER_PICK + ';'
+				+ ' var el = ' + adapter.pick + ';'
 				+ ' if (!el) return { ok: false, error: "no-composer" };'
 				+ ' el.focus();'
 				+ ' var proto = Object.getPrototypeOf(el);'
@@ -1749,18 +1824,116 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * The script that submits the composer through DeepSeek's own handler.
+		 * The script that fills a contenteditable composer.
 		 *
-		 * Its composer runs `onKeyDown` and, for a plain Enter, calls the very
-		 * function its send button calls. Dispatching a bubbling Enter therefore
-		 * runs the user's own code path — no invented shortcut, and no need to
-		 * guess at the send button's generated class name.
+		 * The DOM selection is the only interface every one of these editors
+		 * agrees on, so it is set explicitly — select everything, write, then put
+		 * the caret at the end — and a `selectionchange` is dispatched after the
+		 * range is set: Chromium's editing commands read the live selection, and
+		 * a synthetic event is the cheap way to make an editor that observes the
+		 * document (Quill does) notice the range it never saw being moved.
+		 *
+		 * Success is measured by the write itself, not by the editor's emptiness:
+		 * a composer may already hold a draft (ChatGPT and Claude persist drafts),
+		 * or a placeholder rendered as a real node inside the editable, so "the
+		 * editor reads non-empty" is not evidence that this fill landed. The
+		 * script therefore records what the editor held before, writes over the
+		 * selected content — `insertText`/`paste` replace a selection, so a draft
+		 * is replaced exactly like the textarea path that overwrites `.value` —
+		 * and only reports `ok` when the content actually changed. Each attempt
+		 * reads back before the next, so no path writes twice; if every path is
+		 * refused the draft survives and the caller reports a failure.
+		 * @param text - the text to place there.
+		 * @param pick - a selector expression for the composer element.
 		 * @returns a self-contained script expression.
 		 */
-		function sendScript() {
+		function editableFillScript(text, pick) {
 			return '(function () {'
 				+ ' try {'
-				+ ' var el = ' + COMPOSER_PICK + ';'
+				+ ' var text = ' + JSON.stringify(text) + ';'
+				+ ' var el = ' + pick + ';'
+				+ ' if (!el) return { ok: false, error: "no-composer" };'
+				+ ' el.focus();'
+				+ ' var doc = el.ownerDocument || document;'
+				+ ' var selection = typeof doc.getSelection === "function" ? doc.getSelection() : null;'
+				+ ' var selectAll = function () {'
+				+ '   if (!selection) return;'
+				+ '   try {'
+				+ '     var whole = doc.createRange();'
+				+ '     whole.selectNodeContents(el);'
+				+ '     selection.removeAllRanges();'
+				+ '     selection.addRange(whole);'
+				+ '     doc.dispatchEvent(new Event("selectionchange"));'
+				+ '   } catch (error) {}'
+				+ ' };'
+				+ ' var read = function () {'
+				+ '   var inner = el.innerText == null ? el.textContent : el.innerText;'
+				+ '   return String(inner == null ? "" : inner);'
+				+ ' };'
+				+ ' var command = function () {'
+				+ '   try { return doc.execCommand("insertText", false, text) === true }'
+				+ '   catch (error) { return false }'
+				+ ' };'
+				+ ' var paste = function () {'
+				+ '   try {'
+				+ '     var data = new DataTransfer();'
+				+ '     data.setData("text/plain", text);'
+				+ '     el.dispatchEvent(new ClipboardEvent("paste", {'
+				+ '       clipboardData: data, bubbles: true, cancelable: true'
+				+ '     }));'
+				+ '     return true;'
+				+ '   } catch (error) { return false }'
+				+ ' };'
+				+ ' var multiline = text.indexOf(String.fromCharCode(10)) !== -1;'
+				+ ' var before = read();'
+				+ ' selectAll();'
+				+ ' var value = before;'
+				+ ' if (multiline) paste(); else command();'
+				+ ' value = read();'
+				+ ' if (value === before) {'
+				+ '   selectAll();'
+				+ '   if (multiline) command(); else paste();'
+				+ '   value = read();'
+				+ ' }'
+				+ ' if (value === before && text.trim() !== "") {'
+				+ '   el.textContent = text;'
+				+ '   el.dispatchEvent(new Event("input", { bubbles: true }));'
+				+ '   value = read();'
+				+ ' }'
+				+ ' if (selection) {'
+				+ '   try {'
+				+ '     var end = doc.createRange();'
+				+ '     end.selectNodeContents(el);'
+				+ '     end.collapse(false);'
+				+ '     selection.removeAllRanges();'
+				+ '     selection.addRange(end);'
+				+ '   } catch (error) {}'
+				+ ' }'
+				+ ' var landed = value.trim() !== "" && value !== before;'
+				+ ' return { ok: text.trim() === "" || landed, length: text.length };'
+				+ ' } catch (error) {'
+				+ ' return { ok: false, error: String(error && error.message || error) };'
+				+ ' }'
+				+ ' })()'
+		}
+
+		/**
+		 * The script that submits the composer through the site's own handler.
+		 *
+		 * Every one of these composers sends on a plain Enter: DeepSeek's runs
+		 * `onKeyDown` and calls the very function its send button calls, and the
+		 * three ProseMirror/Quill editors bind Enter to their submit path the same
+		 * way. Dispatching a bubbling Enter therefore runs the user's own code
+		 * path — no invented shortcut, and no need to guess at the send button's
+		 * generated class name.
+		 * @param siteId - the site whose composer to submit.
+		 * @returns a self-contained script expression.
+		 */
+		function sendScript(siteId) {
+			const adapter = composerAdapter(siteId)
+			return '(function () {'
+				+ ' try {'
+				+ ' var el = ' + adapter.pick + ';'
 				+ ' if (!el) return { ok: false, error: "no-composer" };'
 				+ ' el.focus();'
 				+ ' el.dispatchEvent(new KeyboardEvent("keydown", {'
@@ -1777,17 +1950,23 @@ window.__ModuleLoader__.load({
 		/**
 		 * The script that reports what the composer currently holds.
 		 *
-		 * DeepSeek clears its textarea once a send has been accepted, so an empty
-		 * composer is the receipt that the message actually went out — a much
-		 * better signal than assuming the click worked.
+		 * Every site clears its composer once a send has been accepted, so an
+		 * empty composer is the receipt that the message actually went out — a
+		 * much better signal than assuming the click worked. A textarea stores the
+		 * text in `.value`; a contenteditable editor stores it in its DOM.
+		 * @param siteId - the site whose composer to read.
 		 * @returns a self-contained script expression.
 		 */
-		function probeScript() {
+		function probeScript(siteId) {
+			const adapter = composerAdapter(siteId)
+			const read = adapter.kind === 'editable'
+				? 'var value = String(el.innerText == null ? (el.textContent == null ? "" : el.textContent) : el.innerText);'
+				: 'var value = String(el.value == null ? "" : el.value);'
 			return '(function () {'
 				+ ' try {'
-				+ ' var el = ' + COMPOSER_PICK + ';'
+				+ ' var el = ' + adapter.pick + ';'
 				+ ' if (!el) return { ok: false, error: "no-composer" };'
-				+ ' var value = String(el.value == null ? "" : el.value);'
+				+ ' ' + read
 				+ ' return { ok: true, empty: value.trim() === "", length: value.length };'
 				+ ' } catch (error) {'
 				+ ' return { ok: false, error: String(error && error.message || error) };'
@@ -1796,19 +1975,33 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * The script that clicks DeepSeek's own send button.
+		 * The script that clicks the site's own send button.
 		 *
 		 * The fallback for when the Enter path is refused. The button's class name
 		 * is a build-time hash, so it is found by its accessible name instead —
 		 * and it is never clicked when the composer was already cleared, which is
 		 * what stops a double send.
+		 * @param siteId - the site whose composer the button belongs to.
 		 * @returns a self-contained script expression.
 		 */
-		function clickSendScript() {
+		function clickSendScript(siteId) {
+			const adapter = composerAdapter(siteId)
 			return '(function () {'
 				+ ' try {'
 				+ ' var wanted = /send|submit|发送/i;'
-				+ ' var nodes = document.querySelectorAll("button, [role=button]");'
+				+ ' var composer = ' + adapter.pick + ';'
+				+ ' var form = composer && typeof composer.closest === "function" ? composer.closest("form") : null;'
+				+ ' var nodes = (form || document).querySelectorAll("button, [role=button]");'
+				+ ' var box = composer && typeof composer.getBoundingClientRect === "function"'
+				+ '   ? composer.getBoundingClientRect() : null;'
+				// A page-wide match for /send/ finds a sidebar "Send feedback" before
+				// the composer's own button on any of these sites, so an unscoped
+				// search is confined to the band around the composer.
+				+ ' var near = function (rect) {'
+				+ '   if (form) return true;'
+				+ '   if (!box) return true;'
+				+ '   return rect.top < box.bottom + 240 && rect.bottom > box.top - 240;'
+				+ ' };'
 				+ ' for (var i = 0; i < nodes.length; i += 1) {'
 				+ ' var node = nodes[i];'
 				+ ' if (node.disabled === true) continue;'
@@ -1819,6 +2012,7 @@ window.__ModuleLoader__.load({
 				+ ' if (!wanted.test(name)) continue;'
 				+ ' var rect = node.getBoundingClientRect();'
 				+ ' if (rect.width <= 0 || rect.height <= 0) continue;'
+				+ ' if (!near(rect)) continue;'
 				+ ' node.click();'
 				+ ' return { ok: true, found: true };'
 				+ ' }'
@@ -1848,43 +2042,58 @@ window.__ModuleLoader__.load({
 		/**
 		 * Fill the guest's composer.
 		 * @param text - the text to place there.
+		 * @param siteId - the site whose composer to fill; the active one by default.
 		 * @returns a result describing what happened.
 		 */
-		async function fillComposer(text) {
-			return runInGuest(fillScript(text))
+		async function fillComposer(text, siteId = activeSiteId) {
+			return runInGuest(fillScript(text, siteId))
 		}
 
 		/**
 		 * Wait, then ask the composer whether the send landed.
-		 * @param delayMs - how long to give DeepSeek to accept the message.
+		 *
+		 * "The editor reads empty" is the primary receipt. It is not the only
+		 * acceptable one: some editors keep a placeholder node *inside* the
+		 * editable that `innerText` reports as text, so the editor never reads
+		 * literally empty after a send. In that case the receipt is that most of
+		 * the filled text is gone — a refusal leaves all of it there.
+		 * @param delayMs - how long to give the site to accept the message.
+		 * @param siteId - the site whose composer to read; the active one by default.
+		 * @param expectedLength - how long the filled text was.
 		 * @returns true once the composer has been cleared.
 		 */
-		async function composerCleared(delayMs) {
+		async function composerCleared(delayMs, siteId = activeSiteId, expectedLength = 0) {
 			await new Promise((resolve) => setTimeout(resolve, delayMs))
-			const probe = await runInGuest(probeScript())
-			return probe.ok === true && probe.empty === true
+			const probe = await runInGuest(probeScript(siteId))
+			if (probe.ok !== true) return false
+			if (probe.empty === true) return true
+			const length = Number(probe.length)
+			return Number.isFinite(length) && expectedLength > 0 && length < expectedLength / 2
 		}
 
 		/**
-		 * Put text into DeepSeek's composer and, when asked, submit it.
+		 * Put text into the guest's composer and, when asked, submit it.
 		 * @param text - the text to place in the composer.
+		 * @param siteId - the site whose composer to use.
 		 * @param options - `{ send }` to submit it as well.
 		 * @returns `{ ok, length, sent, via?, error? }`.
 		 */
-		async function pushToDeepSeek(text, options = {}) {
-			const filled = await fillComposer(text)
+		async function pushToComposer(text, siteId, options = {}) {
+			const filled = await fillComposer(text, siteId)
 			if (filled.ok !== true) return filled
 			if (options.send !== true) return { ...filled, sent: false }
-			// React commits the new value asynchronously, so pressing Enter in the
-			// same tick would submit whatever was there before.
+			// React (and every editor above) commits the new value asynchronously,
+			// so pressing Enter in the same tick would submit whatever was there
+			// before — or nothing at all.
 			await new Promise((resolve) => setTimeout(resolve, 120))
-			const pressed = await runInGuest(sendScript())
+			const pressed = await runInGuest(sendScript(siteId))
 			if (pressed.ok !== true) return { ...filled, sent: false, error: pressed.error }
-			if (await composerCleared(800)) return { ...filled, sent: true, via: 'enter' }
+			const expected = Number(filled.length) || text.length
+			if (await composerCleared(800, siteId, expected)) return { ...filled, sent: true, via: 'enter' }
 			// The Enter path was refused (its handler is a no-op when the composer
-			// reads as unsubmittable). Try DeepSeek's own button before giving up.
-			const clicked = await runInGuest(clickSendScript())
-			if (clicked.found === true && await composerCleared(800)) {
+			// reads as unsubmittable). Try the site's own button before giving up.
+			const clicked = await runInGuest(clickSendScript(siteId))
+			if (clicked.found === true && await composerCleared(800, siteId, expected)) {
 				return { ...filled, sent: true, via: 'button' }
 			}
 			return { ...filled, sent: false, error: 'not-sent' }
@@ -2369,30 +2578,44 @@ window.__ModuleLoader__.load({
 
 			const push = React.useCallback(async (send) => {
 				if (preview.trim() === '') return
+				// Read at push time, not captured at render time: the site can be
+				// switched from the toolbar while the picker is open, and the fill
+				// must land in the site the person is looking at. The guest's own
+				// URL wins when it names a site, because the dropdown flips before a
+				// switch finishes navigating and the old page is still the DOM that
+				// executeJavaScript sees.
+				let onSite
+				try {
+					onSite = guest === null ? undefined : siteOfUrl(guest.element.getURL())
+				} catch (error) {
+					onSite = undefined
+				}
+				const siteId = onSite?.id ?? guestState().site
+				const siteName = siteById(siteId).label
 				setBusy(true)
 				setToast('')
 				try {
 					setPickerOpen(false)
 					// Let the guest become visible again before scripting it.
 					await new Promise((resolve) => setTimeout(resolve, 120))
-					const result = await pushToDeepSeek(preview, { send })
+					const result = await pushToComposer(preview, siteId, { send })
 					if (result.ok !== true) {
 						setToast(result.error === 'no-composer'
-							? t('toast.nocomposer')
+							? format(t('toast.nocomposer'), { site: siteName })
 							: format(t('status.failed'), { error: String(result.error) }))
 						return
 					}
-					// The selection has been consumed either way — it is in
-					// DeepSeek's composer now — so leaving it ticked would only make
-					// the next push repeat this one.
+					// The selection has been consumed either way — it is in the
+					// site's composer now — so leaving it ticked would only make the
+					// next push repeat this one.
 					setSelected(new Set())
 					setQuestion('')
 					if (send && result.sent === true) {
-						setToast(format(t('toast.sent'), { count: result.length ?? preview.length }))
+						setToast(format(t('toast.sent'), { count: result.length ?? preview.length, site: siteName }))
 					} else if (send) {
-						setToast(t('toast.sendPending'))
+						setToast(format(t('toast.sendPending'), { site: siteName }))
 					} else {
-						setToast(format(t('toast.filled'), { count: result.length ?? preview.length }))
+						setToast(format(t('toast.filled'), { count: result.length ?? preview.length, site: siteName }))
 					}
 				} finally {
 					setBusy(false)
@@ -2459,12 +2682,14 @@ window.__ModuleLoader__.load({
 					'data-state': state.failure !== '' ? 'error' : (isDeepSeek ? (bound !== null ? 'bound' : 'unbound') : 'site'),
 				}, statusGlyph),
 				h('span', { key: 'gap', className: 'dswc-gap' }),
-				isDeepSeek ? h('button', {
+				// Quoting context works on all four sites (each composer has an
+				// adapter); only the Session binding below stays DeepSeek-only.
+				h('button', {
 					key: 'send',
 					type: 'button',
 					className: 'dswc-button',
 					onClick: () => setPickerOpen((open) => !open),
-				}, pickerOpen ? t('action.back') : t('action.send')) : null,
+				}, pickerOpen ? t('action.back') : t('action.send')),
 				h('button', {
 					key: 'reload',
 					type: 'button',
@@ -2679,9 +2904,10 @@ window.__ModuleLoader__.load({
 							placeholder: t('picker.questionPlaceholder'),
 							onChange: (event) => setQuestion(event.target.value),
 						}),
-						h('label', { key: 'plabel', className: 'dswc-label' }, t('picker.preview')),
+						h('label', { key: 'plabel', className: 'dswc-label' },
+							format(t('picker.preview'), { site: siteLabel })),
 						h('pre', { key: 'preview', className: 'dswc-preview' }, preview),
-						h('p', { key: 'hint', className: 'dswc-muted' }, t('picker.hint')),
+						h('p', { key: 'hint', className: 'dswc-muted' }, format(t('picker.hint'), { site: siteLabel })),
 						h('div', { key: 'actions', className: 'dswc-actions' }, [
 							h('button', {
 								key: 'send',
@@ -2921,33 +3147,35 @@ window.__ModuleLoader__.load({
 			 */
 			async function pushSelectionToWebChat(rawText) {
 				const quoted = quoteSelection(rawText, t('ctxmenu.preamble'))
-				// Context handoff is a DeepSeek capability; the panel may be showing
-				// another site, so come back to DeepSeek before filling.
-				if (activeSiteId !== 'deepseek') {
-					try {
-						await switchSite('deepseek')
-					} catch (error) {
-						// A failed switch is reported by the panel itself.
-					}
-				}
+				// Context handoff works on every site now, so the selection goes to
+				// whichever one is showing: switching to DeepSeek just to fill a
+				// composer would throw away the site the person chose.
 				let opened = openDoor()
+				let nextAttempt = 0
 				const deadline = Date.now() + 14000
 				while (Date.now() < deadline) {
 					if (!opened) opened = openDoor()
-					// Only fill once the guest actually sits on DeepSeek: while a site
-					// switch is still navigating, the old page is still the DOM that
-					// executeJavaScript sees, and filling its search box would be wrong.
-					let onDeepSeek = false
+					const site = activeSiteId
+					// Only fill once the guest actually sits on that site: while a
+					// site switch is still navigating, the old page is still the DOM
+					// that executeJavaScript sees, and filling its composer would be
+					// wrong.
+					let onSite = false
 					if (guest !== null) {
 						try {
-							onDeepSeek = siteOfUrl(guest.element.getURL())?.id === 'deepseek'
+							onSite = siteOfUrl(guest.element.getURL())?.id === site
 						} catch (error) {
-							onDeepSeek = false
+							onSite = false
 						}
 					}
-					if (onDeepSeek) {
-						const filled = await fillComposer(quoted)
-						if (filled !== null && filled !== undefined && filled.ok === true) {
+					if (onSite && Date.now() >= nextAttempt) {
+						const filled = await fillComposer(quoted, site)
+						if (filled === null || filled === undefined || filled.ok !== true) {
+							// A composer that is on screen but refusing the write is
+							// not going to accept a retry 250 ms later; each attempt
+							// re-selects and re-pastes, so leave a second between them.
+							nextAttempt = Date.now() + 1200
+						} else {
 							showFloatingToast(format(t('toast.selectionFilled'), { count: filled.length ?? quoted.length }))
 							try {
 								guest.element.focus()
@@ -3038,6 +3266,13 @@ window.__ModuleLoader__.load({
 
 		exports.apply = apply
 		exports.inject = inject
+		// Test seam: the smoke test checks the per-site composer scripts without a
+		// desktop guest, which is the one part of this bundle it cannot render.
+		// The app never sets the flag, so the production export surface stays
+		// `apply` + `inject` alone.
+		if (globalThis.__DSH_WEBChat_TEST__ === true) {
+			exports.__test = { COMPOSER_ADAPTERS, fillScript, probeScript, sendScript }
+		}
 		return module.exports
 	},
 })
